@@ -8,14 +8,13 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/conversioncmds.c,v 1.29 2006/07/14 14:52:18 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/conversioncmds.c,v 1.32.2.1 2009/02/27 16:35:31 heikki Exp $
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/heapam.h"
-#include "catalog/catquery.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_conversion.h"
@@ -30,7 +29,7 @@
 #include "utils/syscache.h"
 
 #include "cdb/cdbvars.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 
 static void AlterConversionOwner_internal(Relation rel, Oid conversionOid,
 							  Oid newOwnerId);
@@ -110,6 +109,7 @@ CreateConversionCommand(CreateConversionStmt *stmt)
 					 CStringGetDatum(""),
 					 CStringGetDatum(result),
 					 Int32GetDatum(0));
+
 	/*
 	 * All seem ok, go ahead (possible failure would be a duplicate conversion
 	 * name)
@@ -119,7 +119,11 @@ CreateConversionCommand(CreateConversionStmt *stmt)
 					 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "CreateConversionCommand");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 }
 
@@ -154,16 +158,6 @@ DropConversionCommand(List *name, DropBehavior behavior, bool missing_ok)
 	}
 
 	ConversionDrop(conversionOid, behavior);
-	
-	if (Gp_role == GP_ROLE_DISPATCH)
-	{
-		DropStmt * stmt = makeNode(DropStmt);
-		stmt->objects = list_make1(name);
-		stmt->removeType = OBJECT_CONVERSION;
-		stmt->behavior=behavior;
-		stmt->missing_ok = true;
-		CdbDispatchUtilityStatement((Node *) stmt, "DropConversionCommand");
-	}
 }
 
 /*
@@ -177,9 +171,6 @@ RenameConversion(List *name, const char *newname)
 	HeapTuple	tup;
 	Relation	rel;
 	AclResult	aclresult;
-	cqContext	cqc2;
-	cqContext	cqc;
-	cqContext  *pcqCtx;
 
 	rel = heap_open(ConversionRelationId, RowExclusiveLock);
 
@@ -190,34 +181,23 @@ RenameConversion(List *name, const char *newname)
 				 errmsg("conversion \"%s\" does not exist",
 						NameListToString(name))));
 
-	pcqCtx = caql_addrel(cqclr(&cqc), rel);
-
-	tup = caql_getfirst(
-			pcqCtx,
-			cql("SELECT * FROM pg_conversion "
-				" WHERE oid = :1 "
-				" FOR UPDATE ",
-				ObjectIdGetDatum(conversionOid)));
-
+	tup = SearchSysCacheCopy(CONVOID,
+							 ObjectIdGetDatum(conversionOid),
+							 0, 0, 0);
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for conversion %u", conversionOid);
 
 	namespaceOid = ((Form_pg_conversion) GETSTRUCT(tup))->connamespace;
 
 	/* make sure the new name doesn't exist */
-	if (caql_getcount(
-				caql_addrel(cqclr(&cqc2), rel),
-				cql("SELECT COUNT(*) FROM pg_conversion "
-					" WHERE conname = :1 "
-					" AND connamespace = :2 ",
-					CStringGetDatum((char *) newname),
-					ObjectIdGetDatum(namespaceOid))))
-	{
+	if (SearchSysCacheExists(CONNAMENSP,
+							 CStringGetDatum(newname),
+							 ObjectIdGetDatum(namespaceOid),
+							 0, 0))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("conversion \"%s\" already exists in schema \"%s\"",
 						newname, get_namespace_name(namespaceOid))));
-	}
 
 	/* must be owner */
 	if (!pg_conversion_ownercheck(conversionOid, GetUserId()))
@@ -232,7 +212,8 @@ RenameConversion(List *name, const char *newname)
 
 	/* rename */
 	namestrcpy(&(((Form_pg_conversion) GETSTRUCT(tup))->conname), newname);
-	caql_update_current(pcqCtx, tup); /* implicit update of index as well */
+	simple_heap_update(rel, &tup->t_self, tup);
+	CatalogUpdateIndexes(rel, tup);
 
 	heap_close(rel, NoLock);
 	heap_freetuple(tup);
@@ -287,20 +268,12 @@ AlterConversionOwner_internal(Relation rel, Oid conversionOid, Oid newOwnerId)
 {
 	Form_pg_conversion convForm;
 	HeapTuple	tup;
-	cqContext	cqc;
-	cqContext  *pcqCtx;
 
 	Assert(RelationGetRelid(rel) == ConversionRelationId);
 
-	pcqCtx = caql_addrel(cqclr(&cqc), rel);
-
-	tup = caql_getfirst(
-			pcqCtx,
-			cql("SELECT * FROM pg_conversion "
-				" WHERE oid = :1 "
-				" FOR UPDATE ",
-				ObjectIdGetDatum(conversionOid)));
-
+	tup = SearchSysCacheCopy(CONVOID,
+							 ObjectIdGetDatum(conversionOid),
+							 0, 0, 0);
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for conversion %u", conversionOid);
 
@@ -343,7 +316,9 @@ AlterConversionOwner_internal(Relation rel, Oid conversionOid, Oid newOwnerId)
 	 */
 	convForm->conowner = newOwnerId;
 
-	caql_update_current(pcqCtx, tup); /* implicit update of index as well */
+	simple_heap_update(rel, &tup->t_self, tup);
+
+	CatalogUpdateIndexes(rel, tup);
 
 	/* Update owner dependency reference */
 	changeDependencyOnOwner(ConversionRelationId, conversionOid,

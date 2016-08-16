@@ -9,11 +9,12 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/execScan.c,v 1.38.2.2 2007/02/02 00:07:27 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/execScan.c,v 1.43 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "codegen/codegen_wrapper.h"
 
 #include "executor/executor.h"
 #include "miscadmin.h"
@@ -25,12 +26,12 @@
 /*
  * getScanMethod
  *   Return ScanMethod for a given table type.
- *
- * Return NULL if the given type is TableTypeInvalid or not defined in TableType.
  */
 static const ScanMethod *
 getScanMethod(int tableType)
 {
+	Assert(tableType >= TableTypeHeap && tableType < TableTypeInvalid);
+
 	/*
 	 * scanMethods
 	 *    Array that specifies different scan methods for various table types.
@@ -55,11 +56,6 @@ getScanMethod(int tableType)
 	};
 	
 	COMPILE_ASSERT(ARRAY_SIZE(scanMethods) == TableTypeInvalid);
-
-	if (tableType < 0 && tableType >= TableTypeInvalid)
-	{
-		return NULL;
-	}
 
 	return &scanMethods[tableType];
 }
@@ -112,7 +108,7 @@ ExecScan(ScanState *node,
 	 * storage allocated in the previous tuple cycle.  
 	 */
 	econtext = node->ps.ps_ExprContext;
-    ResetExprContext(econtext);
+	ResetExprContext(econtext);
 
 	/*
 	 * get a tuple from the access method loop until we obtain a tuple which
@@ -232,18 +228,20 @@ tlist_matches_tupdesc(PlanState *ps, List *tlist, Index varno, TupleDesc tupdesc
 		if (!var || !IsA(var, Var))
 			return false;		/* tlist item not a Var */
 
+		/* if these Asserts fail, planner messed up */
 		Assert(var->varlevelsup == 0);
 		if (var->varattno != attrno)
 			return false;		/* out of order */
 		if (att_tup->attisdropped)
 			return false;		/* table contains dropped columns */
+
 		/*
-		 * Note: usually the Var's type should match the tupdesc exactly,
-		 * but in situations involving unions of columns that have different
+		 * Note: usually the Var's type should match the tupdesc exactly, but
+		 * in situations involving unions of columns that have different
 		 * typmods, the Var may have come from above the union and hence have
 		 * typmod -1.  This is a legitimate situation since the Var still
-		 * describes the column, just not as exactly as the tupdesc does.
-		 * We could change the planner to prevent it, but it'd then insert
+		 * describes the column, just not as exactly as the tupdesc does. We
+		 * could change the planner to prevent it, but it'd then insert
 		 * projection steps just to convert from specific typmod to typmod -1,
 		 * which is pretty silly.
 		 */
@@ -251,7 +249,7 @@ tlist_matches_tupdesc(PlanState *ps, List *tlist, Index varno, TupleDesc tupdesc
 			(var->vartypmod != att_tup->atttypmod &&
 			 var->vartypmod != -1))
 			return false;		/* type mismatch */
-			
+
 		tlist_item = lnext(tlist_item);
 	}
 
@@ -298,6 +296,12 @@ InitScanStateRelationDetails(ScanState *scanState, Plan *plan, EState *estate)
 	scanState->ss_currentRelation = currentRelation;
 	ExecAssignScanType(scanState, RelationGetDescr(currentRelation));
 	ExecAssignScanProjectionInfo(scanState);
+
+	ProjectionInfo *projInfo = scanState->ps.ps_ProjInfo;
+	if (NULL != projInfo && projInfo->pi_isVarList){
+		enroll_ExecVariableList_codegen(ExecVariableList,
+				&projInfo->ExecVariableList_gen_info.ExecVariableList_fn, projInfo, scanState->ss_ScanTupleSlot);
+	}
 
 	scanState->tableType = getTableType(scanState->ss_currentRelation);
 }
@@ -429,8 +433,6 @@ getTableType(Relation rel)
 TupleTableSlot *
 ExecTableScanRelation(ScanState *scanState)
 {
-	Assert(scanState->tableType >= 0 && scanState->tableType < TableTypeInvalid);
-	
 	return ExecScan(scanState, getScanMethod(scanState->tableType)->accessMethod);
 }
 
@@ -441,8 +443,6 @@ ExecTableScanRelation(ScanState *scanState)
 void
 BeginTableScanRelation(ScanState *scanState)
 {
-	Assert(scanState->tableType >= 0 && scanState->tableType < TableTypeInvalid);
-
 	getScanMethod(scanState->tableType)->beginScanMethod(scanState);
 }
 
@@ -453,8 +453,6 @@ BeginTableScanRelation(ScanState *scanState)
 void
 EndTableScanRelation(ScanState *scanState)
 {
-	Assert(scanState->tableType >= 0 && scanState->tableType < TableTypeInvalid);
-
 	getScanMethod(scanState->tableType)->endScanMethod(scanState);
 }
 
@@ -465,8 +463,7 @@ EndTableScanRelation(ScanState *scanState)
 void
 ReScanRelation(ScanState *scanState)
 {
-	Assert(scanState->tableType >= 0 && scanState->tableType < TableTypeInvalid);
-
+	const ScanMethod *scanMethod;
 	EState *estate = scanState->ps.state;
 	Index scanrelid = ((Scan *)scanState->ps.plan)->scanrelid;
 	
@@ -478,9 +475,7 @@ ReScanRelation(ScanState *scanState)
 		return;
 	}
 
-	const ScanMethod *scanMethod = getScanMethod(scanState->tableType);
-	Assert(scanMethod != NULL);
-
+	scanMethod = getScanMethod(scanState->tableType);
 	if ((scanState->scan_state & SCAN_SCAN) == 0)
 	{
 		scanMethod->beginScanMethod(scanState);
@@ -496,8 +491,6 @@ ReScanRelation(ScanState *scanState)
 void
 MarkPosScanRelation(ScanState *scanState)
 {
-	Assert(scanState->tableType >= 0 && scanState->tableType < TableTypeInvalid);
-
 	getScanMethod(scanState->tableType)->markPosMethod(scanState);	
 }
 
@@ -508,8 +501,6 @@ MarkPosScanRelation(ScanState *scanState)
 void
 RestrPosScanRelation(ScanState *scanState)
 {
-	Assert(scanState->tableType >= 0 && scanState->tableType < TableTypeInvalid);
-
 	getScanMethod(scanState->tableType)->restrPosMethod(scanState);	
 }
 

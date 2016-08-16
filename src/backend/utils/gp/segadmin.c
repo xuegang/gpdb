@@ -15,7 +15,7 @@
 #include "catalog/pg_filespace_entry.h"
 #include "catalog/pg_proc.h"
 #include "cdb/cdbresynchronizechangetracking.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 #include "cdb/cdbpersistentdatabase.h"
 #include "cdb/cdbpersistentfilespace.h"
 #include "cdb/cdbpersistentrelation.h"
@@ -522,7 +522,7 @@ dispatch_add_to_segment(int16 pridbid, int16 segdbid, ArrayType *fsmap)
 	 * array_out caches data in flinfo, as we cannot just
 	 * do a DirectFunctionCall1().
 	 */
-	fmgr_info(ARRAY_OUT_OID, &flinfo);
+	fmgr_info(F_ARRAY_OUT, &flinfo);
 	a = OutputFunctionCall(&flinfo, PointerGetDatum(fsmap));
 
 	appendStringInfo(q,
@@ -532,7 +532,12 @@ dispatch_add_to_segment(int16 pridbid, int16 segdbid, ArrayType *fsmap)
 					 segdbid,
 					 a);
 
-	CdbDoCommand(q->data, true, false);
+	CdbDispatchCommand(q->data,
+						DF_CANCEL_ON_ERROR|
+						DF_WITH_SNAPSHOT,
+						NULL);
+	pfree(q->data);
+	pfree(q);
 }
 
 /*
@@ -613,7 +618,12 @@ remove_segment_persistent_entries(int16 pridbid, seginfo *i)
 						 pridbid,
 						 i->db.dbid);
 
-		CdbDoCommand(q->data, true, false);
+		CdbDispatchCommand(q->data,
+							DF_CANCEL_ON_ERROR|
+							DF_WITH_SNAPSHOT,
+							NULL);
+		pfree(q->data);
+		pfree(q);
 	}
 }
 

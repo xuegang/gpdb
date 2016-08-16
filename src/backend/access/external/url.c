@@ -96,8 +96,10 @@ static int extssl_libcurldebug = 1;
 char extssl_key_full[MAXPGPATH] = {0};
 char extssl_cer_full[MAXPGPATH] = {0};
 char extssl_cas_full[MAXPGPATH] = {0};
-int readable_external_table_timeout = 0;
 #endif
+
+/* GUC */
+int readable_external_table_timeout = 0;
 
 /* Will hold the last curl error					*/
 /* Currently it is in use only for SSL connection,	*/
@@ -2116,7 +2118,7 @@ static size_t gp_proto1_read(char *buf, int bufsz, URL_FILE *file, CopyState pst
 			 */
 			memcpy(&line_number, curl->in.ptr + curl->in.bot, len);
 			line_number = local_ntohll(line_number);
-			pstate->cur_lineno = line_number ? line_number - 1 : (int64) - 1 << 63;
+			pstate->cur_lineno = line_number ? line_number - 1 : INT64_MIN;
 			curl->in.bot += 8;
 			Assert(curl->in.bot <= curl->in.top);
 			continue;
@@ -2293,7 +2295,7 @@ static size_t curl_fwrite(char *buf, int nbytes, URL_FILE* file, CopyState pstat
 	 */
 	if(!curl->out.ptr)
 	{
-		const int bufsize = 64 * 1024 * sizeof(char);
+		const int bufsize = writable_external_table_bufsize * 1024 * sizeof(char);
 		MemoryContext oldcontext = CurrentMemoryContext;
 		
 		MemoryContextSwitchTo(CurTransactionContext); /* TODO: is there a better cxt to use? */
@@ -2478,66 +2480,6 @@ url_fflush(URL_FILE *file, CopyState pstate)
 			break;
     }
 }
-
-void
-url_rewind(URL_FILE *file, const char *relname)
-{
-	char *url = file->url;
-    switch(file->type)
-    {
-		case CFTYPE_FILE:
-			fstream_rewind(file->u.file.fp);
-			break;
-
-		case CFTYPE_EXEC:
-			/* we'll need to execute the command again */
-			assert(0); /* There is no way the following code is right. */
-			url_fclose(file, true, relname);
-
-			/* most of these are null fo us. */
-			url_fopen(url, false, NULL, NULL, NULL, 0);
-			break;
-
-#ifdef USE_CURL
-		case CFTYPE_CURL:
-			/* halt transaction */
-			{
-				CURLMcode e;
-				if (!file->u.curl.for_write)
-				{
-					// TODO: Is this for reading only?
-					e = curl_multi_remove_handle(multi_handle, file->u.curl.handle);
-					if (CURLM_OK != e)
-						elog(ERROR, "internal error curl_multi_remove_handle (%d - %s)", e, curl_easy_strerror(e));
-
-					/* restart */
-					e = curl_multi_add_handle(multi_handle, file->u.curl.handle);
-					if (CURLM_OK != e)
-						elog(ERROR, "internal error curl_multi_add_handle (%d - %s)", e, curl_easy_strerror(e));
-				}
-
-				/* ditch buffer - write will recreate - resets stream pos*/
-				if (file->u.curl.in.ptr)
-					free(file->u.curl.in.ptr);
-
-				file->u.curl.gp_proto = 0;
-				file->u.curl.error = file->u.curl.eof = 0;
-				memset(&file->u.curl.in, 0, sizeof(file->u.curl.in));
-				memset(&file->u.curl.block, 0, sizeof(file->u.curl.block));
-			}
-			break;
-#endif
-
-		case CFTYPE_CUSTOM:
-			elog(ERROR, "rewind support not yet implemented in custom protocol");
-			break;
-			
-		default: /* unknown or supported type - oh dear */
-			break;
-
-    }
-}
-
 
 /*
  * interpretError - formats a brief message and/or the exit code from pclose()

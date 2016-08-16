@@ -12,11 +12,10 @@
 #ifndef CDBDATABASEINFO_H
 #define CDBDATABASEINFO_H
 
-#include "utils/palloc.h"
-#include "storage/fd.h"
+#include "catalog/pg_appendonly.h"
 #include "storage/itemptr.h"
 #include "storage/dbdirnode.h"
-#include "catalog/pg_appendonly.h"
+#include "utils/tqual.h"
 
 /* ------------------------------------------------------------------------
  * Structure definitions
@@ -154,7 +153,7 @@ typedef struct PgAppendOnlyHashEntry
 	Oid					 relationId;
 
 	/* Pointer */
-	AppendOnlyEntry		*aoEntry;
+	Form_pg_appendonly	aoEntry;
 } PgAppendOnlyHashEntry;
 
 
@@ -214,6 +213,7 @@ typedef struct DatabaseInfo
 extern DatabaseInfo *DatabaseInfo_Collect(
 	Oid 		database,
 	Oid 		defaultTablespace,
+	Snapshot	snapshot,
 	bool        collectGpRelationNodeInfo,
 	bool		collectAppendOnlyCatalogSegmentInfo,
 	bool		scanFileSystem);

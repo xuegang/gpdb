@@ -7,7 +7,8 @@ from gppylib import gplog
 from mock import patch
 from gppylib.mainUtils import ExceptionNoStackTraceNeeded
 from gprestore_filter import get_table_schema_set, extract_schema, extract_table, \
-                            process_data, get_table_info, process_schema, check_valid_schema, check_valid_table, check_dropped_table
+                            process_data, get_table_info, process_schema, check_valid_schema, check_valid_table, \
+                            check_dropped_table, get_table_from_alter_table
 
 
 logger = gplog.get_unittest_logger()
@@ -21,8 +22,8 @@ class GpRestoreFilterTestCase(unittest.TestCase):
             fd.write(' pepper.ao2   \n')
 
         (sc, tb) = get_table_schema_set(fname)
-        self.assertEquals(sc, set(['public', 'pepper']))
-        self.assertEquals(tb, set([('public','ao1'), ('pepper','ao2')]))
+        self.assertEquals(sc, set(['public', ' pepper']))
+        self.assertEquals(tb, set([('public','ao1'), (' pepper','ao2   ')]))
 
         os.remove(fname)
 
@@ -32,7 +33,7 @@ class GpRestoreFilterTestCase(unittest.TestCase):
             fd.write('publicao1\n')
             fd.write(' pepper.ao2   \n')
 
-        with self.assertRaisesRegexp(Exception, "Bad table in filter list"):
+        with self.assertRaisesRegexp(Exception, "need more than 1 value to unpack"):
             get_table_schema_set(fname)
 
         os.remove(fname)
@@ -55,8 +56,8 @@ class GpRestoreFilterTestCase(unittest.TestCase):
 
     def test_extract_schema01(self):
         line = 'SET search_path = pepper pg_catalog;'
-        schema = extract_schema(line)
-        self.assertEquals(schema, None)
+        with self.assertRaisesRegexp(Exception, "Failed to extract schema name"):
+            schema = extract_schema(line)
 
     def test_extract_table00(self):
         line = 'COPY ao_table (column1, column2, column3) FROM stdin;'
@@ -65,8 +66,44 @@ class GpRestoreFilterTestCase(unittest.TestCase):
 
     def test_extract_table01(self):
         line = 'COPYao_table(column1column2column3)FROMstdin;'
-        table = extract_table(line)
-        self.assertEqual(table, None)
+        with self.assertRaisesRegexp(Exception, "Failed to extract table name"):
+            table = extract_table(line)
+
+    def test_get_table_from_alter_table_with_schemaname(self):
+        line = 'ALTER TABLE schema1.table1 OWNER TO gpadmin;'
+        alter_expr = "ALTER TABLE"
+        res = get_table_from_alter_table(line, alter_expr)
+        self.assertEqual(res, 'table1')
+
+    def test_get_table_from_alter_table_without_schemaname(self):
+        line = 'ALTER TABLE table1 OWNER TO gpadmin;'
+        alter_expr = "ALTER TABLE"
+        res = get_table_from_alter_table(line, alter_expr)
+        self.assertEqual(res, 'table1')
+
+    def test_get_table_from_alter_table_with_specialchar(self):
+        line = 'ALTER TABLE Tab#$_1 OWNER TO gpadmin;'
+        alter_expr = "ALTER TABLE"
+        res = get_table_from_alter_table(line, alter_expr)
+        self.assertEqual(res, 'Tab#$_1')
+
+    def test_get_table_from_alter_table_with_specialchar_and_schema(self):
+        line = 'ALTER TABLE "Foo#$1"."Tab#$_1" OWNER TO gpadmin;'
+        alter_expr = "ALTER TABLE"
+        res = get_table_from_alter_table(line, alter_expr)
+        self.assertEqual(res, '"Tab#$_1"')
+
+    def test_get_table_from_alter_table_with_specialchar(self):
+        line = 'ALTER TABLE "T a""b#$_1" OWNER TO gpadmin;'
+        alter_expr = "ALTER TABLE"
+        res = get_table_from_alter_table(line, alter_expr)
+        self.assertEqual(res, '"T a""b#$_1"')
+
+    def test_get_table_from_alter_table_with_specialchar_and_double_quoted_schema(self):
+        line = 'ALTER TABLE "schema1".table1 OWNER TO gpadmin;'
+        alter_expr = "ALTER TABLE"
+        res = get_table_from_alter_table(line, alter_expr)
+        self.assertEqual(res, 'table1')
 
     def test_process_data00(self):
 
@@ -125,7 +162,7 @@ COPY ao_table (column1, column2, column3) FROM stdin;
         dump_tables = set([('pepper', 'ao_table')])
         with open(out_name, 'w') as fdout:
             with open(in_name, 'r') as fdin:
-                process_data(dump_schemas, dump_tables, fdin, fdout)
+                process_data(dump_schemas, dump_tables, fdin, fdout, None)
 
         with open(out_name, 'r') as fd:
             results = fd.read()
@@ -294,7 +331,7 @@ COPY ao_part_table_comp_1_prt_p1_2_prt_1 (column1, column2, column3) FROM stdin;
         dump_tables = set([('public', 'ao_part_table_comp_1_prt_p1_2_prt_1'), ('public', 'ao_part_table_1_prt_p1_2_prt_1')])
         with open(out_name, 'w') as fdout:
             with open(in_name, 'r') as fdin:
-                process_data(dump_schemas, dump_tables, fdin, fdout)
+                process_data(dump_schemas, dump_tables, fdin, fdout, None)
 
         with open(out_name, 'r') as fd:
             results = fd.read()
@@ -327,7 +364,7 @@ COPY ao_table (column1, column2, column3) FROM stdin;
         dump_tables = set([('public', 'ao_table')])
         with open(out_name, 'w') as fdout:
             with open(in_name, 'r') as fdin:
-                process_data(dump_schemas, dump_tables, fdin, fdout)
+                process_data(dump_schemas, dump_tables, fdin, fdout, None)
 
         with open(out_name, 'r') as fd:
             results = fd.read()
@@ -426,7 +463,7 @@ SET search_path = pepper, pg_catalog;
         dump_tables = set([('pepper', 'ao_table')])
         with open(out_name, 'w') as fdout:
             with open(in_name, 'r') as fdin:
-                process_data(dump_schemas, dump_tables, fdin, fdout)
+                process_data(dump_schemas, dump_tables, fdin, fdout, None)
 
         with open(out_name, 'r') as fd:
             results = fd.read()
@@ -471,7 +508,7 @@ COPY "测试" (column1, column2, column3) FROM stdin;
         dump_tables = set([('public', '测试')])
         with open(out_name, 'w') as fdout:
             with open(in_name, 'r') as fdin:
-                process_data(dump_schemas, dump_tables, fdin, fdout)
+                process_data(dump_schemas, dump_tables, fdin, fdout, None)
 
         with open(out_name, 'r') as fd:
             results = fd.read()
@@ -482,16 +519,15 @@ COPY "测试" (column1, column2, column3) FROM stdin;
     
     def test_get_table_info00(self):
         line = ''
-        (name, type, schema) = get_table_info(line)
+        (name, type, schema) = get_table_info(line, '-- Name: ')
         self.assertEquals(name, None)
         self.assertEquals(type, None)
         self.assertEquals(schema, None)
 
     def test_get_table_info01(self):
-        line = """--
--- Name: public; Type: ACL; Schema: -; Owner: root
---"""
-        (name, type, schema) = get_table_info(line)
+        line = '-- Name: public; Type: ACL; Schema: -; Owner: root'
+        comment_expr = '-- Name: '
+        (name, type, schema) = get_table_info(line, comment_expr)
         self.assertEquals(name, 'public')
         self.assertEquals(type, 'ACL')
         self.assertEquals(schema, '-')
@@ -542,7 +578,7 @@ CREATE TABLE heap_table1 (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -621,7 +657,7 @@ CREATE TABLE heap_table (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -702,7 +738,7 @@ CREATE TABLE heap_table1 (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -775,7 +811,7 @@ CREATE TABLE heap_table1 (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -856,7 +892,7 @@ CREATE TABLE heap_table1 (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -917,7 +953,7 @@ SET default_tablespace = '';
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -940,7 +976,7 @@ CREATE TABLE heap_table1 (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -958,7 +994,7 @@ SET default_tablespace = '';
 
 --
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1006,7 +1042,7 @@ SET default_tablespace = '';
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1029,7 +1065,7 @@ CREATE TABLE heap_table1 (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1090,7 +1126,7 @@ SET default_tablespace = '';
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1117,7 +1153,7 @@ COPY ao_part_table from stdin;
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1135,7 +1171,7 @@ SET default_tablespace = '';
 
 --
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1187,7 +1223,7 @@ SET default_tablespace = '';
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1214,7 +1250,7 @@ COPY ao_part_table from stdin;
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1232,7 +1268,7 @@ SET default_tablespace = '';
 
 --
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1284,7 +1320,7 @@ SET default_tablespace = '';
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1307,7 +1343,7 @@ CREATE TABLE ao_part_table (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1325,7 +1361,7 @@ SET default_tablespace = '';
 
 --
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1373,7 +1409,7 @@ SET default_tablespace = '';
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1408,7 +1444,7 @@ CREATE TABLE ao_part_table (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1426,7 +1462,7 @@ SET default_tablespace = '';
 
 --
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1474,7 +1510,7 @@ SET default_tablespace = '';
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1509,7 +1545,7 @@ CREATE TABLE ao_part_table (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1561,7 +1597,7 @@ SET default_tablespace = '';
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: public; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 --
@@ -1584,7 +1620,7 @@ CREATE TABLE ao_part_table (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1634,7 +1670,7 @@ SET search_path = some_schema, pg_catalog;
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: some_schema; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY public.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 
@@ -1662,7 +1698,7 @@ CREATE TABLE ao_part_table (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1771,7 +1807,7 @@ SET search_path = some_schema, pg_catalog;
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: some_schema; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY some_schema.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 
@@ -1799,7 +1835,7 @@ CREATE TABLE ao_part_table (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1861,7 +1897,7 @@ SET search_path = some_schema, pg_catalog;
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: some_schema; Owner: dcddev; Tablespace:
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY some_schema.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 
@@ -1905,7 +1941,7 @@ $$ LANGUAGE plpgsql;"""
 
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -1965,7 +2001,7 @@ SET search_path = some_schema, pg_catalog;
 -- Name: ao_part_table_constraint; Type: CONSTRAINT; Schema: some_schema; Owner: dcddev; Tablespace: 
 --
 
-ALTER TABLE ONLY ao_part_table
+ALTER TABLE ONLY some_schema.ao_part_table
     ADD CONSTRAINT constraint_name PRIMARY KEY (name);
 
 
@@ -1993,7 +2029,7 @@ CREATE TABLE ao_part_table (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -2271,7 +2307,7 @@ GRANT ALL ON TABLE user_table TO user_role_b;
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -2377,19 +2413,22 @@ GRANT ALL ON TABLE user_table TO user_role_b;
     def test_check_dropped_table00(self):
         line = 'DROP TABLE public.ao_part_table;'
         dump_tables = [('public', 'ao_part_table')]
-        output = check_dropped_table(line, dump_tables)
+        drop_table_expr = 'DROP TABLE '
+        output = check_dropped_table(line, dump_tables, None, drop_table_expr)
         self.assertTrue(output)
   
     def test_check_dropped_table01(self):
         line = 'DROP TABLE public.ao_part_table;'
         dump_tables = [('pepper', 'ao_part_table')]
-        output = check_dropped_table(line, dump_tables)
+        drop_table_expr = 'DROP TABLE '
+        output = check_dropped_table(line, dump_tables, None, drop_table_expr)
         self.assertFalse(output) 
 
     def test_check_dropped_table02(self):
         line = 'DROP TABLE public.ao_part_table;'
         dump_tables = [('public', 'ao_table')]
-        output = check_dropped_table(line, dump_tables)
+        drop_table_expr = 'DROP TABLE '
+        output = check_dropped_table(line, dump_tables, None, drop_table_expr)
         self.assertFalse(output) 
 
     def test_process_schema_foreign_table(self):
@@ -2421,7 +2460,7 @@ CREATE FOREIGN TABLE ao_part_table (
             
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET search_path = public, pg_catalog;
 
@@ -2585,7 +2624,7 @@ GRANT ALL ON TABLE user_table TO user_role_b;
      
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -2750,7 +2789,7 @@ GRANT ALL ON TABLE "测试" TO user_role_b;
      
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -2913,7 +2952,7 @@ GRANT ALL ON TABLE "Áá" TO user_role_b;
      
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
@@ -3076,7 +3115,7 @@ GRANT ALL ON TABLE "Ж" TO user_role_b;
      
         with open(infile, 'r') as fdin:
             with open(outfile, 'w') as fdout:
-                process_schema(dump_schemas, dump_tables, fdin, fdout)
+                process_schema(dump_schemas, dump_tables, fdin, fdout, None)
 
         expected_out = """SET statement_timeout = 0;
 SET client_encoding = 'UTF8';

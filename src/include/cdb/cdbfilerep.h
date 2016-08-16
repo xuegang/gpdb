@@ -9,19 +9,16 @@
 #ifndef CDBFILEREP_H
 #define CDBFILEREP_H
 
-#include "c.h"
+#include <signal.h>
+
 #include "utils/pg_crc.h"
-#include "pg_config_manual.h"
 #include "storage/relfilenode.h"
 #include "access/xlogdefs.h"
-#include "cdb/cdbresynchronizechangetracking.h"
 #include "postmaster/primary_mirror_mode.h"
 #include "storage/fd.h"
 #include "storage/dbdirnode.h"
 #include "storage/lwlock.h"
 #include "storage/pg_sema.h"
-#include "storage/spin.h"
-#include "signal.h"
 #include "gpmon/gpmon.h"
 #include "utils/timestamp.h"
 
@@ -358,7 +355,6 @@ outgoing message queue would always have 1 slot and incoming would have mailboxe
 //JNM TODO replace fileRepProcIndex with FILEREP_OUTGOING_MESSAGE_QUEUE ?
 #define FILEREP_OUTGOING_MESSAGE_QUEUE 0
 
-//must be 63 or less due to the gp_verification_history table
 #define FILEREP_VERIFY_MAX_REQUEST_TOKEN_LEN 63
 
 extern FileRepShmem_s	*fileRepShmemArray[FILEREP_SHMEM_MAX_SLOTS];
@@ -455,8 +451,6 @@ typedef enum FileRepMessageHeaderVersion_e {
 
 typedef enum FileRepConsumerProcIndex_e {
 	FileRepMessageTypeXLog=0,
-
-	FileRepMessageTypeVerify, // This needs to be <2 because on primary it is used as the second incoming message slot
 
 	FileRepMessageTypeAO01,
 
@@ -555,8 +549,6 @@ typedef enum FileRepOperation_e {
 
 	FileRepOperationDropTemporaryFiles,
 		/* Drop temporary files */
-
-	FileRepOperationVerify,
 
 	/*
 	  IMPORTANT: If add new operation, add to FileRepOperationToString
@@ -942,15 +934,6 @@ typedef struct FileRepVerifyLoggingOptions_s
 	char resultsPath[MAXPGPATH+1];
 } FileRepVerifyLoggingOptions_s;
 
-
-typedef struct FileRepOperationDescriptionVerify_s
-{
-	FileRepOperationVerificationType_e type;
-	FileRepOperationDescriptionVerify_u desc;
-	FileRepVerifyLoggingOptions_s logOptions;
-
-} FileRepOperationDescriptionVerify_s;
-
 /*
  *
  */
@@ -975,8 +958,6 @@ typedef union FileRepOperationDescription_u
 	FileRepOperationDescriptionValidation_s validation;
 
 	FileRepOperationDescriptionCreate_s create;
-
-	FileRepOperationDescriptionVerify_s verify;
 
 } FileRepOperationDescription_u;
 
@@ -1073,9 +1054,6 @@ typedef enum FileRepProcessType_e {
 
 	FileRepProcessTypeResyncWorker4,
 
-	FileRepProcessTypePrimaryVerification,
-
-	FileRepProcessTypeMirrorVerification,
 /*
 	  IMPORTANT: If add new process type, add to FileRepProcessTypeToString
 

@@ -1,3 +1,7 @@
+[![Build Status](https://travis-ci.org/greenplum-db/gpdb.svg?branch=master)](https://travis-ci.org/greenplum-db/gpdb)
+
+----------------------------------------------------------------------
+
 ![Greenplum](/gpAux/releng/images/logo-greenplum.png)
 
 The Greenplum Database (GPDB) is an advanced, fully featured, open
@@ -36,16 +40,15 @@ to the segments, and collects the results.
   You will need to add the following Python modules (2.7 & 2.6 are
   supported) into your installation
 
-  * psi
-  * lockfile
+  * psutil
+  * lockfile (>= 0.9.1)
   * paramiko
   * setuptools
   * epydoc
 
-   Ensure the ed text-editor is installed for gpinitsystem. For RHEL/Centos:
-   ```
-   sudo yum install ed
-   ```
+  If necessary, upgrade modules using "pip install --upgrade".
+  pip should be at least version 7.x.x.
+
 
 ## Code layout
 
@@ -70,6 +73,11 @@ throughout the codebase, but a few larger additions worth noting:
   In PostgreSQL, the user manual lives here. In Greenplum, the user
   manual is distributed separately (see http://gpdb.docs.pivotal.io),
   and only the reference pages used to build man pages are here.
+
+* __ci/__
+
+  Contains configuration files for the GPDB continuous integration system.
+ 
 
 * __src/backend/cdb/__
 
@@ -101,6 +109,76 @@ throughout the codebase, but a few larger additions worth noting:
   FTS is a process that runs in the master node, and periodically
   polls the segments to maintain the status of each segment.
 
+## Build GPDB with Planner
+
+```
+# Clean environment
+make distclean
+
+# Configure build environment to install at /usr/local/gpdb
+./configure --prefix=/usr/local/gpdb
+
+# Compile and install
+make
+make install
+
+# Bring in greenplum environment into your running shell
+source /usr/local/gpdb/greenplum_path.sh
+
+# Start demo cluster (gpdemo-env.sh is created which contain
+# __PGPORT__ and __MASTER_DATA_DIRECTORY__ values)
+cd gpAux/gpdemo
+make cluster
+source gpdemo-env.sh
+```
+
+The directory and the TCP ports for the demo cluster can be changed on the fly:
+
+```
+DATADIRS=/tmp/gpdb-cluster MASTER_PORT=15432 PORT_BASE=25432 make cluster
+```
+
+The TCP port for the regression test can be changed on the fly:
+
+```
+PGPORT=15432 make installcheck-good
+```
+
+
+## Build GPDB with GPORCA
+
+Only need to change the `configure` with additional option `--enable-orca`.
+```
+# Configure build environment to install at /usr/local/gpdb
+# Enable GPORCA
+# Build with perl module (PL/Perl)
+# Build with python module (PL/Python)
+# Build with XML support
+./configure --enable-orca --with-perl --with-python --with-libxml --prefix=/usr/local/gpdb
+```
+
+Once build and started, run `psql` and check the GPOPT (e.g. GPORCA) version:
+
+```
+select gp_opt_version();
+```
+
+## Build GPDB with code generation enabled
+
+To build GPDB with code generation (codegen) enabled, you will need cmake 2.8 or higher
+and a recent version of llvm and clang (include headers and developer libraries). Codegen utils
+is currently developed against the LLVM 3.7.X release series. You can find more details about the codegen feature,
+including details about obtaining the prerequisites, building and testing GPDB with codegen in the [Codegen README](src/backend/codegen).
+
+In short, you can change the `configure` with additional option
+`--enable-codegen`, optionally giving the path to llvm and clang libraries on
+your system.
+```
+# Configure build environment to install at /usr/local/gpdb
+# Enable CODEGEN
+./configure --enable-codegen --prefix=/usr/local/gpdb --with-codegen-prefix="/path/to/llvm;/path/to/clang"
+```
+
 ## Regression tests
 
 * The default regression tests
@@ -126,42 +204,64 @@ make installcheck-bugbuster
   some tests are known to fail with Greenplum. The
   __installcheck-good__ schedule excludes those tests.
 
-## Basic GPDB source configuration, compilation, gpdemo cluster creation and test execution example
+## Development with Docker
 
-* Configure build environment
+We provide a docker image with all dependencies required to compile and test
+GPDB. You can view the dependency dockerfile at `./docker/base/Dockerfile`.
+The image is hosted on docker hub at `pivotaldata/gpdb-devel`. This docker
+image is currently under heavy development.
 
-```
-configure --prefix=<install location>
-```
+A quickstart guide to Docker can be found on the [Pivotal Engineering Journal](http://engineering.pivotal.io/post/docker-gpdb/).
 
-* Compilation and install
+Known issues:
+* The `installcheck-good` make target has at least 4 failures, some of which
+  are non-deterministic
 
-```
-make
-make install
-```
+### Running regression tests with Docker
 
-* Bring in greenplum environment into your running shell
+1. Create a docker host with 8gb RAM and 4 cores
+    ```bash
+    docker-machine create -d virtualbox --virtualbox-cpu-count 4 --virtualbox-disk-size 50000 --virtualbox-memory 8192 gpdb
+    eval $(docker-machine env gpdb)
+    ```
 
-```
-source <install location>/greenplum_path.sh
-```
+1. Build your code on gpdb-devel rootfs
+    ```bash
+    cd [path/to/gpdb]
+    docker build .
+    # image beefc4f3 built
+    ```
+    The top level Dockerfile will automatically sync your current working
+    directory into the docker image. This means that any code you are working
+    on will automatically be built and ready for testing in the docker context
 
-* Start demo cluster (gpdemo-env.sh is created which contain
-  __PGPORT__ and __MASTER_DATA_DIRECTORY__ values)
+1. Log into docker image
+    ```bash
+    docker run -it beefc4f3
+    ```
 
+1. As `gpadmin` user run `installcheck-good`
+    ```bash
+    su gpadmin
+    cd /workspace/gpdb
+    make installcheck-good
+    ```
 
-```
-cd gpAux/gpdemo
-make cluster
-source gpdemo-env.sh
-```
+### Caveats
 
-* Run tests
+* No Space Left On Device
+    On macOS the docker-machine vm can periodically become full with unused images.
+    You can clear these images with a combination of docker commands.
+    ```bash
+    # assuming no currently running containers
+    # remove all stopped containers from cache
+    docker ps -aq | xargs -n 1 docker rm
+    # remove all untagged images
+    docker images -aq --filter dangling=true | xargs -n 1 docker rmi
+    ```
 
-```
-make installcheck-good
-```
+    Alternatively you can use the (beta) Native macOS docker client now available
+    in docker 1.12.
 
 ## Glossary
 
@@ -177,3 +277,5 @@ make installcheck-good
 
 For Greenplum Database documentation, please check online docs:
 http://gpdb.docs.pivotal.io
+
+There is also a Vagrant-based quickstart guide for developers in `vagrant/README.md`.

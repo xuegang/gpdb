@@ -7,7 +7,7 @@
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/access/tupdesc.h,v 1.51 2006/10/04 00:30:07 momjian Exp $
+ * $PostgreSQL: pgsql/src/include/access/tupdesc.h,v 1.53 2008/01/01 19:45:56 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -79,6 +79,15 @@ typedef struct tupleDesc
 	int			tdrefcount;		/* reference count, or -1 if not counting */
 }	*TupleDesc;
 
+/*
+ * When dispatching a planned statement from QD to QEs, we need to be able
+ * to transmit TupleDescs. TupleDesc doesn't have the Node header, so for
+ * convenience of the read and out functions, we wrap them in TupleDescNode
+ * structs, which do.
+ *
+ * These are never serialized on disk, only in the read/outfast protocol,
+ * as part of PlannedStmts.
+ */
 typedef struct tupleDescNode
 {
 	NodeTag		type;
@@ -108,7 +117,7 @@ extern void DecrTupleDescRefCount(TupleDesc tupdesc);
 
 #define ReleaseTupleDesc(tupdesc) \
 	do { \
-		if ((tupdesc)->tdrefcount > 0) \
+		if ((tupdesc)->tdrefcount >= 0) \
 			DecrTupleDescRefCount(tupdesc); \
 	} while (0)
 

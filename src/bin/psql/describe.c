@@ -22,12 +22,12 @@
 #include "settings.h"
 #include "variables.h"
 
-
 static bool describeOneTableDetails(const char *schemaname,
 						const char *relationname,
 						const char *oid,
 						bool verbose);
 static int add_distributed_by_footer(const char* oid, PQExpBufferData *inoutbuf, PQExpBufferData *buf);
+static int add_partition_by_footer(const char* oid, PQExpBufferData *inoutbuf, PQExpBufferData *buf);
 static void add_tablespace_footer(printTableContent *const cont, char relkind,
 					  Oid tablespace, const bool newline);
 static void add_role_attribute(PQExpBuffer buf, const char *const str);
@@ -41,10 +41,11 @@ static bool describeOneTSConfig(const char *oid, const char *nspname,
 static void printACLColumn(PQExpBuffer buf, const char *colname);
 static bool isGPDB(void);
 static bool isGPDB4200OrLater(void);
+static bool isGPDB5000OrLater(void);
 
 /* GPDB 3.2 used PG version 8.2.10, and we've moved the minor number up since then for each release,  4.1 = 8.2.15 */
 /* Allow for a couple of future releases.  If the version isn't in this range, we are talking to PostgreSQL, not GPDB */
-#define mightBeGPDB() (pset.sversion >= 80210 && pset.sversion < 80222)
+#define mightBeGPDB() (pset.sversion >= 80210 && pset.sversion < 80400)
 
 static bool isGPDB(void)
 {
@@ -121,6 +122,27 @@ isGPDB4300OrLater(void)
 				"where attrelid = 'pg_catalog.pg_proc'::regclass and "
 				"attname = 'prodataaccess'", false);
 		retValue = PQntuples(result) > 0;
+	}
+	return retValue;
+}
+
+
+/*
+ * If GPDB version is 5.0, pg_proc has provariadic as column number 20.
+ * When we have version() returns GPDB version instead of "main build dev" or
+ * something similar, we'll fix this function.
+ */
+static bool isGPDB5000OrLater(void)
+{
+	bool	retValue = false;
+
+	if (isGPDB() == true)
+	{
+		PGresult   *res;
+
+		res = PSQLexec("select attnum from pg_catalog.pg_attribute where attrelid = 1255 and attname = 'provariadic'", false);
+		if (PQntuples(res) == 1)
+			retValue = true;
 	}
 	return retValue;
 }
@@ -340,6 +362,24 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 						  " CASE\n"
 						  "  WHEN p.proisagg THEN '%s'\n"
 						  "  WHEN p.proiswindow THEN '%s'\n"
+						  "  WHEN p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype THEN '%s'\n"
+						  "  ELSE '%s'\n"
+						  "END as \"%s\"",
+						  gettext_noop("Result data type"),
+						  gettext_noop("Argument data types"),
+		/* translator: "agg" is short for "aggregate" */
+						  gettext_noop("agg"),
+						  gettext_noop("window"),
+						  gettext_noop("trigger"),
+						  gettext_noop("normal"),
+						  gettext_noop("Type"));
+	else if (isGPDB5000OrLater())
+		appendPQExpBuffer(&buf,
+						  "  pg_catalog.pg_get_function_result(p.oid) as \"%s\",\n"
+						  "  pg_catalog.pg_get_function_arguments(p.oid) as \"%s\",\n"
+						  " CASE\n"
+						  "  WHEN p.proisagg THEN '%s'\n"
+						  "  WHEN p.proiswin THEN '%s'\n"
 						  "  WHEN p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype THEN '%s'\n"
 						  "  ELSE '%s'\n"
 						  "END as \"%s\"",
@@ -1407,7 +1447,7 @@ describeOneTableDetails(const char *schemaname,
 		if (!result)
 			goto error_return;
 
-		if (PQgetisnull(result, 0, 0))
+		if (PQgetisnull(result, 0, 0) || PQgetvalue(result, 0, 0)[0] == '\0')
 		{
 			tableinfo.compressionType = pg_malloc(sizeof("None") + 1);
 			strcpy(tableinfo.compressionType, "None");
@@ -1463,9 +1503,6 @@ describeOneTableDetails(const char *schemaname,
 								  schemaname, relationname);
 			else if(tableinfo.relstorage == 'x')
 				printfPQExpBuffer(&title, _("External table \"%s.%s\""),
-								  schemaname, relationname);
-			else if(tableinfo.relstorage == 'f')
-				printfPQExpBuffer(&title, _("Foreign table \"%s.%s\""),
 								  schemaname, relationname);
 			else
 				printfPQExpBuffer(&title, _("Table \"%s.%s\""),
@@ -2011,26 +2048,6 @@ describeOneTableDetails(const char *schemaname,
 			printTableAddFooter(&cont, buf.data);
 		}
 
-
-		/* print foreign table information */
-        if (tableinfo.relstorage == 'f')
-		{
-			/* count and get Foreign table footers
-			 * always have 1 footer: server name
-			 */
-			printfPQExpBuffer(&buf,
-							  "SELECT s.srvname\n"
-							  "FROM pg_catalog.pg_foreign_table f, pg_catalog.pg_class c, pg_catalog.pg_foreign_server s\n"
-							  "WHERE c.oid = f.reloid AND f.server = s.oid AND c.oid = '%s'", oid);
-
-			result = PSQLexec(buf.data, false);
-			if (!result)
-				goto error_return;
-
-			printfPQExpBuffer(&buf, _("Foreign Server: %s"), PQgetvalue(result, 0, 0));
-			printTableAddFooter(&cont, buf.data);
-		}
-
         /* print indexes */
 		if (tableinfo.hasindex)
 		{
@@ -2532,6 +2549,15 @@ describeOneTableDetails(const char *schemaname,
 		resetPQExpBuffer(&tmpbuf);
 		add_distributed_by_footer(oid, &tmpbuf, &buf);
 		printTableAddFooter(&cont, tmpbuf.data);
+
+		/* print 'partition by' clause */
+		if (tuples > 0)
+		{
+			resetPQExpBuffer(&tmpbuf);
+			add_partition_by_footer(oid, &tmpbuf, &buf);
+			printTableAddFooter(&cont, tmpbuf.data);
+		}
+
 		add_tablespace_footer(&cont, tableinfo.relkind, tableinfo.tablespace,
 							  true);
 	}
@@ -2667,6 +2693,80 @@ add_distributed_by_footer(const char* oid, PQExpBufferData *inoutbuf, PQExpBuffe
 
 		PQclear(result1);
 	}
+
+	return 0; /* success */
+}
+
+/*
+ * Add a 'partition by' description to the footer.
+ */
+static int
+add_partition_by_footer(const char* oid, PQExpBufferData *inoutbuf, PQExpBufferData *buf)
+{
+	PGresult	*result = NULL;
+
+	/* check if current relation is root partition, if it is root partition, at least 1 row returns */
+	printfPQExpBuffer(buf, "SELECT parrelid FROM pg_catalog.pg_partition WHERE parrelid = '%s'", oid);
+	result = PSQLexec(buf->data, false);
+
+	if (!result)
+		return 1;
+	int nRows = PQntuples(result);
+	int nPartKey = 0;
+
+	PQclear(result);
+
+	if(nRows)
+	{
+		/* query partition key on the root partition */
+		printfPQExpBuffer(buf,
+			"WITH att_arr AS (SELECT unnest(paratts) \n"
+			"	FROM pg_catalog.pg_partition p \n"
+			"	WHERE p.parrelid = '%s' AND p.parlevel = 0 AND p.paristemplate = false), \n"
+			"idx_att AS (SELECT row_number() OVER() AS idx, unnest AS att_num FROM att_arr) \n"
+			"SELECT attname FROM pg_catalog.pg_attribute, idx_att \n"
+			"	WHERE attrelid='%s' AND attnum = att_num ORDER BY idx ",
+			oid, oid);
+	}
+	else
+	{
+		/* query partition key on the intermediate partition */
+		printfPQExpBuffer(buf,
+			"WITH att_arr AS (SELECT unnest(paratts) FROM pg_catalog.pg_partition p, \n"
+			"	(SELECT parrelid, parlevel \n"
+			"		FROM pg_catalog.pg_partition p, pg_catalog.pg_partition_rule pr \n"
+			"		WHERE pr.parchildrelid='%s' AND p.oid = pr.paroid) AS v \n"
+			"	WHERE p.parrelid = v.parrelid AND p.parlevel = v.parlevel+1 AND p.paristemplate = false), \n"
+			"idx_att AS (SELECT row_number() OVER() AS idx, unnest AS att_num FROM att_arr) \n"
+			"SELECT attname FROM pg_catalog.pg_attribute, idx_att \n"
+			"	WHERE attrelid='%s' AND attnum = att_num ORDER BY idx ",
+			oid, oid);
+	}
+
+	result = PSQLexec(buf->data, false);
+	if (!result)
+		return 1;
+	nPartKey = PQntuples(result);
+
+	if (nPartKey)
+	{
+		char *partColName;
+		int i = 0;
+		appendPQExpBuffer(inoutbuf, "Partition by: (");
+		for (i = 0; i < nPartKey; i++)
+		{
+			if (i > 0)
+				appendPQExpBuffer(inoutbuf, ", ");
+			partColName = PQgetvalue(result, i, 0);
+
+			if (!partColName)
+				return 1;
+			appendPQExpBuffer(inoutbuf, "%s", partColName);
+		}
+		appendPQExpBuffer(inoutbuf, ")");
+	}
+
+	PQclear(result);
 
 	return 0; /* success */
 }
@@ -2945,7 +3045,6 @@ listDbRoleSettings(const char *pattern, const char *pattern2)
  * i - indexes
  * v - views
  * s - sequences
- * r - foreign tables   *GPDB only*
  * (any order of the above is fine)
  * If tabtypes is empty, we default to \dtvsr.
  */
@@ -2958,15 +3057,14 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 	bool		showViews = strchr(tabtypes, 'v') != NULL;
 	bool		showSeq = strchr(tabtypes, 's') != NULL;
 	bool		showExternal = strchr(tabtypes, 'x') != NULL;
-	bool		showForeign = strchr(tabtypes, 'r') != NULL;
 
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
 	static const bool translate_columns[] = {false, false, true, false, false, false, false};
 
-	if (!(showTables || showIndexes || showViews || showSeq || showExternal || showForeign))
-		showTables = showViews = showSeq = showExternal = showForeign = true;
+	if (!(showTables || showIndexes || showViews || showSeq || showExternal))
+		showTables = showViews = showSeq = showExternal = true;
 
 	if (strchr(tabtypes, 'P') != NULL)
 	{
@@ -2998,8 +3096,8 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 	if (isGPDB())   /* GPDB? */
 		appendPQExpBuffer(&buf,
 				  ", CASE c.relstorage WHEN 'h' THEN '%s' WHEN 'x' THEN '%s' WHEN 'a' "
-				  "THEN '%s' WHEN 'v' THEN '%s' WHEN 'c' THEN '%s' WHEN 'f' THEN '%s' END as \"%s\"\n",
-				  gettext_noop("heap"), gettext_noop("external"), gettext_noop("append only"), gettext_noop("none"), gettext_noop("append only columnar"), gettext_noop("foreign"), gettext_noop("Storage"));
+				  "THEN '%s' WHEN 'v' THEN '%s' WHEN 'c' THEN '%s' END as \"%s\"\n",
+				  gettext_noop("heap"), gettext_noop("external"), gettext_noop("append only"), gettext_noop("none"), gettext_noop("append only columnar"), gettext_noop("Storage"));
 
 	if (showIndexes)
 		appendPQExpBuffer(&buf,
@@ -3028,7 +3126,7 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 		   "\n     LEFT JOIN pg_catalog.pg_class c2 ON i.indrelid = c2.oid");
 
 	appendPQExpBuffer(&buf, "\nWHERE c.relkind IN (");
-	if (showTables || showExternal || showForeign)
+	if (showTables || showExternal)
 		appendPQExpBuffer(&buf, "'r',");
 	if (showViews)
 		appendPQExpBuffer(&buf, "'v',");
@@ -3049,8 +3147,6 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 		appendPQExpBuffer(&buf, "'h', 'a', 'c',");
 	if (showExternal)
 		appendPQExpBuffer(&buf, "'x',");
-	if (showForeign)
-		appendPQExpBuffer(&buf, "'f',");
 	if (showViews)
 		appendPQExpBuffer(&buf, "'v',");
 	appendPQExpBuffer(&buf, "''");		/* dummy */
@@ -3924,184 +4020,6 @@ describeOneTSConfig(const char *oid, const char *nspname, const char *cfgname,
 	return true;
 }
 
-
-/*
- * \dew
- *
- * Describes foreign-data wrappers
- */
-bool
-listForeignDataWrappers(const char *pattern, bool verbose)
-{
-	PQExpBufferData buf;
-	PGresult   *res;
-	printQueryOpt myopt = pset.popt;
-
-	if (pset.sversion < 80400 && (pset.sversion < 80214 || !isGPDB()))  /* allow for Greenplum 8.2.x with FDWs */
-	{
-		fprintf(stderr, _("The server (version %d.%d) does not support foreign-data wrappers.\n"),
-				pset.sversion / 10000, (pset.sversion / 100) % 100);
-		return true;
-	}
-
-	initPQExpBuffer(&buf);
-	printfPQExpBuffer(&buf,
-					  "SELECT fdwname AS \"%s\",\n"
-					  "  pg_catalog.pg_get_userbyid(fdwowner) AS \"%s\",\n"
-					  "  fdwvalidator::pg_catalog.regproc AS \"%s\"",
-					  gettext_noop("Name"),
-					  gettext_noop("Owner"),
-					  gettext_noop("Validator"));
-
-	if (verbose)
-	{
-		appendPQExpBuffer(&buf, ",\n  ");
-		printACLColumn(&buf, "fdwacl");
-		appendPQExpBuffer(&buf,
-						  ",\n  fdwoptions AS \"%s\"",
-						  gettext_noop("Options"));
-	}
-
-	appendPQExpBuffer(&buf, "\nFROM pg_catalog.pg_foreign_data_wrapper\n");
-
-	processSQLNamePattern(pset.db, &buf, pattern, false, false,
-						  NULL, "fdwname", NULL, NULL);
-
-	appendPQExpBuffer(&buf, "ORDER BY 1;");
-
-	res = PSQLexec(buf.data, false);
-	termPQExpBuffer(&buf);
-	if (!res)
-		return false;
-
-	myopt.nullPrint = NULL;
-	myopt.title = _("List of foreign-data wrappers");
-	myopt.translate_header = true;
-
-	printQuery(res, &myopt, pset.queryFout, pset.logfile);
-
-	PQclear(res);
-	return true;
-}
-
-/*
- * \des
- *
- * Describes foreign servers.
- */
-bool
-listForeignServers(const char *pattern, bool verbose)
-{
-	PQExpBufferData buf;
-	PGresult   *res;
-	printQueryOpt myopt = pset.popt;
-
-	if (pset.sversion < 80400 && (pset.sversion < 80214 || !isGPDB()))  /* allow for Greenplum 8.2.x */
-	{
-		fprintf(stderr, _("The server (version %d.%d) does not support foreign servers.\n"),
-				pset.sversion / 10000, (pset.sversion / 100) % 100);
-		return true;
-	}
-
-	initPQExpBuffer(&buf);
-	printfPQExpBuffer(&buf,
-					  "SELECT s.srvname AS \"%s\",\n"
-					  "  pg_catalog.pg_get_userbyid(s.srvowner) AS \"%s\",\n"
-					  "  f.fdwname AS \"%s\"",
-					  gettext_noop("Name"),
-					  gettext_noop("Owner"),
-					  gettext_noop("Foreign-data wrapper"));
-
-	if (verbose)
-	{
-		appendPQExpBuffer(&buf, ",\n  ");
-		printACLColumn(&buf, "s.srvacl");
-		appendPQExpBuffer(&buf,
-						  ",\n"
-						  "  s.srvtype AS \"%s\",\n"
-						  "  s.srvversion AS \"%s\",\n"
-						  "  s.srvoptions AS \"%s\"",
-						  gettext_noop("Type"),
-						  gettext_noop("Version"),
-						  gettext_noop("Options"));
-	}
-
-	appendPQExpBuffer(&buf,
-					  "\nFROM pg_catalog.pg_foreign_server s\n"
-	   "     JOIN pg_catalog.pg_foreign_data_wrapper f ON f.oid=s.srvfdw\n");
-
-	processSQLNamePattern(pset.db, &buf, pattern, false, false,
-						  NULL, "s.srvname", NULL, NULL);
-
-	appendPQExpBuffer(&buf, "ORDER BY 1;");
-
-	res = PSQLexec(buf.data, false);
-	termPQExpBuffer(&buf);
-	if (!res)
-		return false;
-
-	myopt.nullPrint = NULL;
-	myopt.title = _("List of foreign servers");
-	myopt.translate_header = true;
-
-	printQuery(res, &myopt, pset.queryFout, pset.logfile);
-
-	PQclear(res);
-	return true;
-}
-
-/*
- * \deu
- *
- * Describes user mappings.
- */
-bool
-listUserMappings(const char *pattern, bool verbose)
-{
-	PQExpBufferData buf;
-	PGresult   *res;
-	printQueryOpt myopt = pset.popt;
-
-	if (pset.sversion < 80400 && (pset.sversion < 80214 || !isGPDB()))  /* allow for Greenplum 8.2.x */
-	{
-		fprintf(stderr, _("The server (version %d.%d) does not support user mappings.\n"),
-				pset.sversion / 10000, (pset.sversion / 100) % 100);
-		return true;
-	}
-
-	initPQExpBuffer(&buf);
-	printfPQExpBuffer(&buf,
-					  "SELECT um.srvname AS \"%s\",\n"
-					  "  um.usename AS \"%s\"",
-					  gettext_noop("Server"),
-					  gettext_noop("User name"));
-
-	if (verbose)
-		appendPQExpBuffer(&buf,
-						  ",\n  um.umoptions AS \"%s\"",
-						  gettext_noop("Options"));
-
-	appendPQExpBuffer(&buf, "\nFROM pg_catalog.pg_user_mappings um\n");
-
-	processSQLNamePattern(pset.db, &buf, pattern, false, false,
-						  NULL, "um.srvname", "um.usename", NULL);
-
-	appendPQExpBuffer(&buf, "ORDER BY 1, 2;");
-
-	res = PSQLexec(buf.data, false);
-	termPQExpBuffer(&buf);
-	if (!res)
-		return false;
-
-	myopt.nullPrint = NULL;
-	myopt.title = _("List of user mappings");
-	myopt.translate_header = true;
-
-	printQuery(res, &myopt, pset.queryFout, pset.logfile);
-
-	PQclear(res);
-	return true;
-}
 
 /*
  * printACLColumn

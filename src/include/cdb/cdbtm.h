@@ -8,7 +8,6 @@
 #define CDBTM_H
 
 #include "storage/lwlock.h"
-#include "utils/hsearch.h"
 #include "lib/stringinfo.h"
 #include "access/xlogdefs.h"
 #include "cdb/cdbdistributedsnapshot.h"
@@ -217,7 +216,7 @@ typedef struct TMGXACT
 	
 	TransactionId				localXid;
 
-	LocalDistribXactRef			localDistribXactRef;
+	LocalDistribXactData		localDistribXactData;
 	
 	bool						explicitBeginRemembered;
 
@@ -306,6 +305,7 @@ extern void getDtxLogInfo(TMGXACT_LOG *gxact_log);
 extern bool notifyCommittedDtxTransactionIsNeeded(void);
 extern void notifyCommittedDtxTransaction(void);
 extern void	rollbackDtxTransaction(void);
+extern DistributedTransactionId getMaxDistributedXid(void);
 
 extern void insertingDistributedCommitted(void);
 extern void insertedDistributedCommitted(void);
@@ -327,7 +327,7 @@ extern DtxState getCurrentDtxState(void);
 extern void sendDtxExplicitBegin(void);
 extern int dtxCurrentPhase1Count(void);
 
-extern bool dispatchDtxCommand(const char *cmd, bool withSnapshot, bool raiseError);
+extern bool dispatchDtxCommand(const char *cmd);
 
 extern void tmShmemInit(void);
 extern int	tmShmemSize(void);

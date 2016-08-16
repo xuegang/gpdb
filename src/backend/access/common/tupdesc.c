@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/common/tupdesc.c,v 1.126 2009/06/11 14:48:53 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/common/tupdesc.c,v 1.122 2008/01/01 19:45:46 momjian Exp $
  *
  * NOTES
  *	  some of the executor utility code such as "ExecTypeFromTL" should be
@@ -19,7 +19,6 @@
 
 #include "postgres.h"
 
-#include "catalog/catquery.h"
 #include "catalog/pg_type.h"
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
@@ -456,7 +455,6 @@ TupleDescInitEntry(TupleDesc desc,
 	HeapTuple	tuple;
 	Form_pg_type typeForm;
 	Form_pg_attribute att;
-	cqContext	*pcqCtx;
 
 	/*
 	 * sanity checks
@@ -495,14 +493,9 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attislocal = true;
 	att->attinhcount = 0;
 
-	pcqCtx = caql_beginscan(
-			NULL,
-			cql("SELECT * FROM pg_type "
-				" WHERE oid = :1 ",
-				ObjectIdGetDatum(oidtypeid)));
-
-	tuple = caql_getnext(pcqCtx);
-
+	tuple = SearchSysCache(TYPEOID,
+						   ObjectIdGetDatum(oidtypeid),
+						   0, 0, 0);
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for type %u", oidtypeid);
 	typeForm = (Form_pg_type) GETSTRUCT(tuple);
@@ -513,7 +506,7 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attalign = typeForm->typalign;
 	att->attstorage = typeForm->typstorage;
 
-	caql_endscan(pcqCtx);
+	ReleaseSysCache(tuple);
 }
 
 
@@ -535,6 +528,7 @@ BuildDescForRelation(List *schema)
 	TupleDesc	desc;
 	TupleConstr *constr = (TupleConstr *) palloc0(sizeof(TupleConstr));
 	char	   *attname;
+	Oid			atttypid;
 	int32		atttypmod;
 	int			attdim;
 
@@ -559,7 +553,7 @@ BuildDescForRelation(List *schema)
 		attnum++;
 
 		attname = entry->colname;
-		atttypmod = entry->typname->typmod;
+		atttypid = typenameTypeId(NULL, entry->typname, &atttypmod);
 		attdim = list_length(entry->typname->arrayBounds);
 
 		if (entry->typname->setof)
@@ -569,8 +563,7 @@ BuildDescForRelation(List *schema)
 							attname)));
 
 		TupleDescInitEntry(desc, attnum, attname,
-						   typenameTypeId(NULL, entry->typname),
-						   atttypmod, attdim);
+						   atttypid, atttypmod, attdim);
 
 		/* Fill in additional stuff not handled by TupleDescInitEntry */
 		if (entry->is_not_null)

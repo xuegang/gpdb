@@ -27,12 +27,13 @@
 #include "nodes/tidbitmap.h"
 
 /*
- * Returns BitmapTableScanMethod for a given table type. Returns NULL
- * if the given type is TableTypeInvalid or not defined in TableType.
+ * Returns BitmapTableScanMethod for a given table type.
  */
 static const ScanMethod *
 getBitmapTableScanMethod(TableType tableType)
 {
+	Assert(tableType >= TableTypeHeap && tableType < TableTypeInvalid);
+
 	/*
 	 * scanMethods
 	 *    Array that specifies different scan methods for various table types.
@@ -58,11 +59,6 @@ getBitmapTableScanMethod(TableType tableType)
 	};
 
 	COMPILE_ASSERT(ARRAY_SIZE(scanMethods) == TableTypeInvalid);
-
-	if (tableType < 0 && tableType >= TableTypeInvalid)
-	{
-		return NULL;
-	}
 
 	return &scanMethods[tableType];
 }
@@ -301,6 +297,19 @@ BitmapTableScanBeginPartition(ScanState *node, AttrNumber *attMap)
 	}
 
 	scanState->needNewBitmapPage = true;
+	/*
+	 * In some cases, the BitmapTableScan needs to re-evaluate the
+	 * bitmap qual. This is determined by the recheckTuples and
+	 * isLossyBitmapPage flags, as well as the type of table.
+	 * The appropriate type of BitmapIndexScan will set this flag
+	 * as follows:
+	 *  Table/Index Type  Lossy    Recheck
+	 *	Heap                1        1
+	 * 	Ao/Lossy            1        0
+	 *	Ao/Non-Lossy        0        0
+	 *	Aocs/Lossy          1        0
+	 *	Aocs/Non-Lossy      0        0
+	 */
 	scanState->recheckTuples = true;
 
 	getBitmapTableScanMethod(node->tableType)->beginScanMethod(node);

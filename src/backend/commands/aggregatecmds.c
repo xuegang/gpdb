@@ -9,7 +9,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/aggregatecmds.c,v 1.41 2006/10/04 00:29:50 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/aggregatecmds.c,v 1.45.2.1 2008/06/08 21:09:52 tgl Exp $
  *
  * DESCRIPTION
  *	  The "DefineFoo" routines take the parse tree and pick out the
@@ -23,7 +23,6 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
-#include "catalog/catquery.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_aggregate.h"
@@ -39,7 +38,7 @@
 #include "utils/syscache.h"
 
 #include "cdb/cdbvars.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 
 /*
  *	DefineAggregate
@@ -67,7 +66,6 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 	Oid			transTypeId;
 	ListCell   *pl;
 	Oid			aggOid;
-	bool need_free_value = false;
 
 	/* Convert list of names to a name and namespace */
 	aggNamespace = QualifiedNameGetCreationNamespace(name, &aggName);
@@ -101,17 +99,11 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 		else if (pg_strcasecmp(defel->defname, "stype1") == 0)
 			transType = defGetTypeName(defel);
 		else if (pg_strcasecmp(defel->defname, "initcond") == 0)
-			initval = defGetString(defel, &need_free_value);
+			initval = defGetString(defel);
 		else if (pg_strcasecmp(defel->defname, "initcond1") == 0)
-			initval = defGetString(defel, &need_free_value);
+			initval = defGetString(defel);
 		else if (pg_strcasecmp(defel->defname, "prefunc") == 0) /* MPP */
 			prelimfuncName = defGetQualifiedName(defel);
-		else if (gp_upgrade_mode && pg_strcasecmp(defel->defname, "oid") == 0) /* OID */
-		{
-			int64 oid = defGetInt64(defel);
-			Assert(oid < FirstBootstrapObjectId);
-			newOid = (Oid)oid;
-		}
 		else
 			ereport(WARNING,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -165,7 +157,7 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 		{
 			numArgs = 1;
 			aggArgTypes = (Oid *) palloc(sizeof(Oid));
-			aggArgTypes[0] = typenameTypeId(NULL, baseType);
+			aggArgTypes[0] = typenameTypeId(NULL, baseType, NULL);
 		}
 	}
 	else
@@ -187,7 +179,7 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 		{
 			TypeName   *curTypeName = (TypeName *) lfirst(lc);
 
-			aggArgTypes[i++] = typenameTypeId(NULL, curTypeName);
+			aggArgTypes[i++] = typenameTypeId(NULL, curTypeName, NULL);
 		}
 	}
 
@@ -197,17 +189,24 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 	 * transtype can't be a pseudo-type, (except during upgrade mode)
 	 * since we need to be able to store values of the transtype.
 	 * However, we can allow polymorphic transtype in some cases
-	 * (AggregateCreate will check).
+	 * (AggregateCreate will check). Also, we allow "internal"
+	 * for functions that want to pass pointers to private data structures;
+	 * but allow that only to superusers, since you could crash the system
+	 * (or worse) by connecting up incompatible internal-using functions
+	 * in an aggregate.
 	 */
-	transTypeId = typenameTypeId(NULL, transType);
-	if (!gp_upgrade_mode &&
-		(get_typtype(transTypeId) == 'p' &&
-		 transTypeId != ANYARRAYOID &&
-		 transTypeId != ANYELEMENTOID))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				 errmsg("aggregate transition data type cannot be %s",
-						format_type_be(transTypeId))));
+	transTypeId = typenameTypeId(NULL, transType, NULL);
+	if (get_typtype(transTypeId) == TYPTYPE_PSEUDO &&
+		!IsPolymorphicType(transTypeId))
+	{
+		if (transTypeId == INTERNALOID && superuser())
+			/* okay */ ;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+					 errmsg("aggregate transition data type cannot be %s",
+							format_type_be(transTypeId))));
+	}
 
 	/*
 	 * Most of the argument-checking is done inside of AggregateCreate
@@ -234,9 +233,13 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters,
 		stmt->args = args;
 		stmt->definition = parameters;
 		stmt->newOid = aggOid;
-		stmt->shadowOid = 0;
+		stmt->arrayOid = stmt->commutatorOid = stmt->negatorOid = InvalidOid;
 		stmt->ordered = ordered;
-		CdbDispatchUtilityStatement((Node *) stmt, "DefineAggregate");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 }
 
@@ -251,7 +254,7 @@ RemoveAggregate(RemoveFuncStmt *stmt)
 	List	   *aggName = stmt->name;
 	List	   *aggArgs = stmt->args;
 	Oid			procOid;
-	Oid			namespaceOid;
+	HeapTuple	tup;
 	ObjectAddress object;
 
 	/* Look up function and make sure it's an aggregate */
@@ -270,18 +273,20 @@ RemoveAggregate(RemoveFuncStmt *stmt)
 	/*
 	 * Find the function tuple, do permissions and validity checks
 	 */
-	namespaceOid = get_func_namespace(procOid);
-	
-	if (!OidIsValid(namespaceOid)) /* should not happen */
+	tup = SearchSysCache(PROCOID,
+						 ObjectIdGetDatum(procOid),
+						 0, 0, 0);
+	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for function %u", procOid);
 
 	/* Permission check: must own agg or its namespace */
 	if (!pg_proc_ownercheck(procOid, GetUserId()) &&
-		!pg_namespace_ownercheck(namespaceOid,
+	  !pg_namespace_ownercheck(((Form_pg_proc) GETSTRUCT(tup))->pronamespace,
 							   GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_PROC,
 					   NameListToString(aggName));
 
+	ReleaseSysCache(tup);
 
 	/*
 	 * Do the deletion
@@ -294,7 +299,11 @@ RemoveAggregate(RemoveFuncStmt *stmt)
 	
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "RemoveAggregate");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 }
 
@@ -308,24 +317,15 @@ RenameAggregate(List *name, List *args, const char *newname)
 	Form_pg_proc procForm;
 	Relation	rel;
 	AclResult	aclresult;
-	cqContext	cqc2;
-	cqContext	cqc;
-	cqContext  *pcqCtx;
 
 	rel = heap_open(ProcedureRelationId, RowExclusiveLock);
 
 	/* Look up function and make sure it's an aggregate */
 	procOid = LookupAggNameTypeNames(name, args, false);
 
-	pcqCtx = caql_addrel(cqclr(&cqc), rel);
-
-	tup = caql_getfirst(
-			pcqCtx,
-			cql("SELECT * FROM pg_proc "
-				" WHERE oid = :1 "
-				" FOR UPDATE ",
-				ObjectIdGetDatum(procOid)));
-
+	tup = SearchSysCacheCopy(PROCOID,
+							 ObjectIdGetDatum(procOid),
+							 0, 0, 0);
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for function %u", procOid);
 	procForm = (Form_pg_proc) GETSTRUCT(tup);
@@ -333,15 +333,11 @@ RenameAggregate(List *name, List *args, const char *newname)
 	namespaceOid = procForm->pronamespace;
 
 	/* make sure the new name doesn't exist */
-	if (caql_getcount(
-				caql_addrel(cqclr(&cqc2), rel),
-				cql("SELECT COUNT(*) FROM pg_proc "
-					" WHERE proname = :1 "
-					" AND proargtypes = :2 "
-					" AND pronamespace = :3 ",
-					CStringGetDatum((char *) newname),
-					PointerGetDatum(&procForm->proargtypes),
-					ObjectIdGetDatum(namespaceOid))))
+	if (SearchSysCacheExists(PROCNAMEARGSNSP,
+							 CStringGetDatum(newname),
+							 PointerGetDatum(&procForm->proargtypes),
+							 ObjectIdGetDatum(namespaceOid),
+							 0))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_FUNCTION),
@@ -365,7 +361,8 @@ RenameAggregate(List *name, List *args, const char *newname)
 
 	/* rename */
 	namestrcpy(&(((Form_pg_proc) GETSTRUCT(tup))->proname), newname);
-	caql_update_current(pcqCtx, tup); /* implicit update of index as well */
+	simple_heap_update(rel, &tup->t_self, tup);
+	CatalogUpdateIndexes(rel, tup);
 
 	heap_close(rel, NoLock);
 	heap_freetuple(tup);

@@ -40,12 +40,12 @@
 #include "cdb/cdbappendonlystoragewrite.h"
 #include "cdb/cdbappendonlyblockdirectory.h"
 
-#define DEFAULT_COMPRESS_LEVEL				 0
-#define MIN_APPENDONLY_BLOCK_SIZE			 8 * 1024
-#define DEFAULT_APPENDONLY_BLOCK_SIZE		32 * 1024
-#define MAX_APPENDONLY_BLOCK_SIZE			 2 * 1024 * 1024
-#define DEFAULT_VARBLOCK_TEMPSPACE_LEN   	 4 * 1024 
-#define DEFAULT_FS_SAFE_WRITE_SIZE			 0
+#define DEFAULT_COMPRESS_LEVEL				 (0)
+#define MIN_APPENDONLY_BLOCK_SIZE			 (8 * 1024)
+#define DEFAULT_APPENDONLY_BLOCK_SIZE		(32 * 1024)
+#define MAX_APPENDONLY_BLOCK_SIZE			 (2 * 1024 * 1024)
+#define DEFAULT_VARBLOCK_TEMPSPACE_LEN   	 (4 * 1024)
+#define DEFAULT_FS_SAFE_WRITE_SIZE			 (0)
 
 /*
  * AppendOnlyInsertDescData is used for inserting data into append-only
@@ -67,7 +67,6 @@ typedef struct AppendOnlyInsertDescData
 	int64           numSequences; /* total number of available sequences */
 	int64           lastSequence; /* last used sequence */
 	BlockNumber		cur_segno;
-	AppendOnlyEntry *aoEntry;
 	FileSegInfo     *fsInfo;
 	VarBlockMaker	varBlockMaker;
 	int64			bufferCount;
@@ -197,8 +196,6 @@ typedef struct AppendOnlyScanDescData
 				 *
 				 * We manage the storage for this.
 				 */
-
-	AppendOnlyEntry		*aoEntry;
 	
 	/*
 	 * The block directory info.
@@ -282,8 +279,6 @@ typedef struct AppendOnlyFetchDescData
 
 	int				totalSegfiles;
 	FileSegInfo 	**segmentFileInfo;
-
-	AppendOnlyEntry *aoEntry;
 
 	char			*segmentFileName;
 	int				segmentFileNameMaxLen;

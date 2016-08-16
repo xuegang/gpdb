@@ -15,6 +15,7 @@
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_appendonly_fn.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_type.h"
@@ -36,12 +37,14 @@ CreateAOAuxiliaryTable(
 		Oid *aoauxiliaryComptypeOid,
 		TupleDesc tupledesc,
 		IndexInfo  *indexInfo,
-		Oid	*classObjectId)
+		Oid	*classObjectId,
+		int16 *coloptions)
 {
 	char aoauxiliary_relname[NAMEDATALEN];
 	char aoauxiliary_idxname[NAMEDATALEN];
 	bool shared_relation;
-	Oid relOid, aoauxiliary_relid, aoauxiliary_idxid;
+	Oid relOid, aoauxiliary_relid = InvalidOid;
+	Oid aoauxiliary_idxid;
 	ObjectAddress baseobject;
 	ObjectAddress aoauxiliaryobject;
 
@@ -104,6 +107,7 @@ CreateAOAuxiliaryTable(
 	 * destroyed when its master is, so there is no need to handle
 	 * the aovisimap relation as temp.
 	 */
+	Oid unusedArrayOid = InvalidOid;
 	aoauxiliary_relid = heap_create_with_catalog(aoauxiliary_relname,
 											     PG_AOSEGMENT_NAMESPACE,
 											     rel->rd_rel->reltablespace,
@@ -123,6 +127,7 @@ CreateAOAuxiliaryTable(
 											     true,
 												 /* valid_opts */ false,
 											     aoauxiliaryComptypeOid,
+												 &unusedArrayOid,
 											     /* persistentTid */ NULL,
 											     /* persistentSerialNum */ NULL);
 
@@ -135,7 +140,7 @@ CreateAOAuxiliaryTable(
 									 indexInfo,
 									 BTREE_AM_OID,
 									 rel->rd_rel->reltablespace,
-									 classObjectId, (Datum) 0,
+									 classObjectId, coloptions, (Datum) 0,
 									 true, false, (Oid *) NULL, true, false,
 									 false, NULL);
 

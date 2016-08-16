@@ -53,9 +53,7 @@
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
-#include "catalog/pg_user_mapping.h"
 #include "catalog/pg_window.h"
-#include "catalog/pg_tidycat.h"
 
 #include "catalog/gp_configuration.h"
 #include "catalog/gp_segment_config.h"
@@ -102,159 +100,6 @@ caql_heapclose(cqContext *pCtx)
 	}
 }
 
-static bool
-is_builtin_object(cqContext *pCtx, HeapTuple tuple)
-{
-	Oid result = InvalidOid;
-
-	if (!HeapTupleIsValid(tuple))
-		return true;
-
-	if (tuple->t_data->t_infomask & HEAP_HASOID)
-		result = HeapTupleGetOid(tuple);
-	else
-	{
-		switch(pCtx->cq_relationId)
-		{
-			case GpPolicyRelationId:
-				result = (Oid) ((FormData_gp_policy *) GETSTRUCT(tuple))->localoid;
-				break;
-			case FastSequenceRelationId:
-				result = (Oid) ((Form_gp_fastsequence) GETSTRUCT(tuple))->objid;
-				break;
-			case AggregateRelationId:
-				result = (Oid) ((Form_pg_aggregate) GETSTRUCT(tuple))->aggfnoid;
-				break;
-			case AccessMethodOperatorRelationId:
-				result = (Oid) ((Form_pg_amop) GETSTRUCT(tuple))->amopclaid;
-				break;
-			case AccessMethodProcedureRelationId:
-				result = (Oid) ((Form_pg_amproc) GETSTRUCT(tuple))->amopclaid;
-				break;
-			case AppendOnlyRelationId:
-				result = (Oid) ((Form_pg_appendonly) GETSTRUCT(tuple))->relid;
-				break;
-			case AttrDefaultRelationId:
-				result = (Oid) ((Form_pg_attrdef) GETSTRUCT(tuple))->adrelid;
-				break;
-			case AttributeRelationId:
-				result = (Oid) ((Form_pg_attribute) GETSTRUCT(tuple))->attrelid;
-				break;
-			case AttributeEncodingRelationId:
-				result = (Oid) ((Form_pg_attribute_encoding) GETSTRUCT(tuple))->attrelid;
-				break;
-			case AuthMemRelationId:
-				result = (Oid) ((Form_pg_auth_members) GETSTRUCT(tuple))->roleid;
-				break;
-			case AuthTimeConstraintRelationId:
-				result = (Oid) ((Form_pg_auth_time_constraint) GETSTRUCT(tuple))->authid;
-				break;
-			case DependRelationId:
-				result = (Oid) ((Form_pg_depend) GETSTRUCT(tuple))->objid;
-				break;
-			case DescriptionRelationId:
-				result = (Oid) ((Form_pg_description) GETSTRUCT(tuple))->objoid;
-				break;
-			case ExtTableRelationId:
-				result = (Oid) ((Form_pg_exttable) GETSTRUCT(tuple))->reloid;
-				break;
-			case FileSpaceEntryRelationId:
-				result = (Oid) ((Form_pg_filespace_entry) GETSTRUCT(tuple))->fsefsoid;
-				break;
-			case IndexRelationId:
-				result = (Oid) ((Form_pg_index) GETSTRUCT(tuple))->indexrelid;
-				break;
-			case InheritsRelationId:
-				result = (Oid) ((Form_pg_inherits) GETSTRUCT(tuple))->inhrelid;
-				break;
-			case PartitionEncodingRelationId:
-				result = (Oid) ((Form_pg_partition_encoding) GETSTRUCT(tuple))->parencoid;
-				break;
-			case PLTemplateRelationId:
-				{
-					char *name_str = pstrdup(NameStr(((Form_pg_pltemplate) GETSTRUCT(tuple))->tmplname));
-					if ((strcmp(name_str, "plpgsql") != 0) ||
-						(strcmp(name_str, "c") != 0) ||
-						(strcmp(name_str, "sql") != 0) ||
-						(strcmp(name_str, "internal") != 0))
-						result = InvalidOid;
-					break;
-				}
-			case TriggerRelationId:
-				result = (Oid) ((Form_pg_trigger) GETSTRUCT(tuple))->tgrelid;
-				break;
-			case RewriteRelationId:
-				result = (Oid) ((Form_pg_rewrite) GETSTRUCT(tuple))->ev_class;
-				break;
-			case ProcCallbackRelationId:
-				result = (Oid) ((Form_pg_proc_callback) GETSTRUCT(tuple))->profnoid;
-				break;
-			case SharedDependRelationId:
-				result = (Oid) ((Form_pg_shdepend) GETSTRUCT(tuple))->objid;
-				break;
-			case SharedDescriptionRelationId:
-				result = (Oid) ((Form_pg_shdescription) GETSTRUCT(tuple))->objoid;
-				break;
-			case StatLastOpRelationId:
-				result = (Oid) ((Form_pg_statlastop) GETSTRUCT(tuple))->objid;
-				break;
-			case StatLastShOpRelationId:
-				result = (Oid) ((Form_pg_statlastshop) GETSTRUCT(tuple))->objid;
-				break;
-			case StatisticRelationId:
-				result = (Oid) ((Form_pg_statistic) GETSTRUCT(tuple))->starelid;
-				break;
-			case TypeEncodingRelationId:
-				result = (Oid) ((Form_pg_type_encoding) GETSTRUCT(tuple))->typid;
-				break;
-			case WindowRelationId:
-				result = (Oid) ((Form_pg_window) GETSTRUCT(tuple))->winfnoid;
-				break;
-
-			default:
-				return false;
-		}
-	}
-	if (result > FirstNormalObjectId)
-		return false;
-
-	return true;
-}
-
-/*
- * Error out when 
- *	- the guc is enable 
- *	- and users try to access catalog on segments
- */
-static void
-disable_catalog_check(cqContext *pCtx, HeapTuple tuple)
-{
-	if (Gp_role != GP_ROLE_DISPATCH && Gp_segment != -1
-		&& gp_disable_catalog_access_on_segment)
-	{
-		if (!is_builtin_object(pCtx, tuple))
-			elog(ERROR, "invalid catalog access on segments (catalog relid: %d)",
-					pCtx->cq_relationId);
-	}
-}
-
-/*
- * Error out when 
- *	- the guc is enable 
- *	- and users try to access catalog - pg_attribute on segments
- */
-static void
-disable_attribute_check(Oid attrelid)
-{
-	if (Gp_role != GP_ROLE_DISPATCH && Gp_segment != -1
-		&& gp_disable_catalog_access_on_segment)
-	{
-		if (attrelid > FirstNormalObjectId)
-			elog(ERROR, "invalid pg_attribute access on segments");
-	}
-}
-
-
 /* ----------------------------------------------------------------
  * cqclr
  * 
@@ -298,22 +143,6 @@ cqContext	*caql_indexOK(cqContext *pCtx, bool bindexOK)
 	pCtx->cq_setidxOK  = true;
 	pCtx->cq_useidxOK  = bindexOK;
 
-	return (pCtx);
-}
-
-/* ----------------------------------------------------------------
- * caql_lockmode()
- * 
- * Change the default lockmode (ie RowExclusiveLock for Delete/Update, 
- * else AccessShareLock) associated with the underlying relation.   
- * Has no effect if the relation is external.
- * ----------------------------------------------------------------
- */
-
-cqContext	*caql_lockmode(cqContext *pCtx, LOCKMODE lm)
-{
-	pCtx->cq_setlockmode = true;
-	pCtx->cq_lockmode	 = lm;
 	return (pCtx);
 }
 
@@ -518,7 +347,6 @@ int caql_getcount(cqContext *pCtx0, cq_list *pcql)
 									   pCtx->cq_NumKeys, 
 									   pCtx->cq_cacheKeys);
 
-		disable_catalog_check(pCtx, tuple);
 		if (HeapTupleIsValid(tuple))
 		{
 			ii++;
@@ -535,7 +363,6 @@ int caql_getcount(cqContext *pCtx0, cq_list *pcql)
 
 	while (HeapTupleIsValid(tuple = systable_getnext(pCtx->cq_sysScan)))
 	{
-		disable_catalog_check(pCtx, tuple);
 		if (HeapTupleIsValid(tuple) && pchn->bDelete)
 		{
 			pCtx->cq_lasttup = tuple;
@@ -595,7 +422,6 @@ HeapTuple caql_getfirst_only(cqContext *pCtx0, bool *pbOnly, cq_list *pcql)
 									   pCtx->cq_NumKeys, 
 									   pCtx->cq_cacheKeys);
 
-		disable_catalog_check(pCtx, tuple);
 		if (HeapTupleIsValid(tuple))
 		{
 			newTup = heap_copytuple(tuple);
@@ -611,8 +437,6 @@ HeapTuple caql_getfirst_only(cqContext *pCtx0, bool *pbOnly, cq_list *pcql)
 
 	if (HeapTupleIsValid(tuple = systable_getnext(pCtx->cq_sysScan)))
 	{
-		disable_catalog_check(pCtx, tuple);
-
 		/* always copy the tuple, because the endscan releases tup memory */
 		newTup = heap_copytuple(tuple);
  
@@ -628,78 +452,6 @@ HeapTuple caql_getfirst_only(cqContext *pCtx0, bool *pbOnly, cq_list *pcql)
 	pCtx->cq_lasttup = newTup; /* need this for update/delete */
 	return (newTup);
 }
-
-/* ----------------------------------------------------------------
- * caql_begin_CacheList()
- * Return a catclist
- * 
- * In general, catquery will choose the syscache when the cql
- * statement contains an equality predicate on *all* of the syscache
- * primary key index columns, eg: 
- *
- *   cql("SELECT * FROM pg_amop WHERE amopopr = :1 and amopclaid = :2 ")
- *
- * will use the AMOPOPID syscache with index
- * AccessMethodOperatorIndexId.  However, the cql statement for a
- * list-search requires an equality predicate on a subset of the
- * initial columns of the index, with *all* of the index columns
- * specified in an ORDER BY clause, eg:
- *
- *   cql("SELECT * FROM pg_amop WHERE amopopr = :1 "
- *       " ORDER BY amopopr, amopclaid ")
- *
- * will use a syscache list-search if this cql statement is an
- * argument to caql_begin_CacheList().  However, the syscache will
- * *not* be used for this statement if it is supplied for
- * caql_beginscan(), since SearchSysCache() can only return (at most)
- * a single tuple.
- *
- * NOTE: caql_begin_CacheList() will assert (Insist!) at runtime if
- * the cql statement does not map to a syscache lookup.
- * NOTE: it may be possible to "collapse" this API into the existing
- * beginscan/getnext/endscan.
- * ----------------------------------------------------------------
- */
-struct catclist *caql_begin_CacheList(cqContext *pCtx0, 
-									  cq_list *pcql)
-{
-	const char*				 caql_str = pcql->caqlStr;
-	const char*				 filenam  = pcql->filename;
-	int						 lineno	  = pcql->lineno;
-	struct caql_hash_cookie	*pchn	  = cq_lookup(caql_str, strlen(caql_str), pcql);
-	cqContext				*pCtx;
-	cqContext				 cqc;
-
-	if (NULL == pchn)
-		elog(ERROR, "invalid caql string: %s\nfile: %s, line %d", 
-			 caql_str, filenam, lineno);
-
-	Assert(!pchn->bInsert); /* INSERT not allowed */
-	Assert(!pchn->bUpdate); /* UPDATE not allowed */
-	Assert(!pchn->bDelete); /* DELETE not allowed */
-
-	/* use the provided context, or provide a clean local ctx  */
-	if (pCtx0)
-		pCtx = pCtx0;
-	else
-		pCtx = cqclr(&cqc);
-
-	/* NOTE: for case of cache list search, we must use syscache */
-	pCtx->cq_bCacheList = true; 
-
-	pCtx = caql_switch(pchn, pCtx, pcql);
-	/* NOTE: caql_switch frees the pcql */
-
-	/* NOTE: must use the SysCache */
-	Insist (pCtx->cq_usesyscache);
-
-	caql_heapclose(pCtx);
-
-	return SearchSysCacheKeyArrayList(pCtx->cq_cacheId, 
-									  pCtx->cq_NumKeys, 
-									  pCtx->cq_cacheKeys);
-}
-
 
 /* ----------------------------------------------------------------
  * caql_beginscan()
@@ -779,8 +531,6 @@ HeapTuple caql_getnext(cqContext *pCtx)
 		pCtx->cq_EOF	 = true;  /* at EOF always, because only 0 or 1 */
 	}
 
-	disable_catalog_check(pCtx, tuple);
-
 	pCtx->cq_lasttup = tuple; /* need this for ReleaseSysCache */
 
 	return (tuple);
@@ -820,8 +570,6 @@ HeapTuple caql_getprev(cqContext *pCtx)
 		
 		pCtx->cq_EOF	 = true;  /* at EOF always, because only 0 or 1 */
 	}
-
-	disable_catalog_check(pCtx, tuple);
 
 	pCtx->cq_lasttup = tuple; /* need this for ReleaseSysCache */
 
@@ -910,7 +658,6 @@ void caql_delete_current(cqContext *pCtx)
 	rel  = pCtx->cq_heap_rel;
 	Assert(RelationIsValid(rel));
 
-	disable_catalog_check(pCtx, pCtx->cq_lasttup);
 	if (HeapTupleIsValid(pCtx->cq_lasttup))
 		simple_heap_delete(rel, &(pCtx->cq_lasttup)->t_self);
 }
@@ -929,8 +676,6 @@ Oid caql_insert(cqContext *pCtx, HeapTuple tup)
 
 	rel  = pCtx->cq_heap_rel;
 	Assert(RelationIsValid(rel));
-
-	disable_catalog_check(pCtx, tup);
 
 	result = simple_heap_insert(rel, tup);
 
@@ -956,8 +701,6 @@ void caql_update_current(cqContext *pCtx, HeapTuple tup)
 	Assert(RelationIsValid(rel));
 
 	Insist(HeapTupleIsValid(pCtx->cq_lasttup));
-
-	disable_catalog_check(pCtx, pCtx->cq_lasttup);
 
 	simple_heap_update(rel, &(pCtx->cq_lasttup)->t_self, tup);
 
@@ -1059,7 +802,6 @@ HeapTuple caql_getattname(cqContext *pCtx, Oid relid, const char *attname)
 {
 	HeapTuple tup;
 
-	disable_attribute_check(relid);
 	tup = SearchSysCacheCopyAttName(relid, attname);
 
 	if (pCtx)
@@ -1109,8 +851,7 @@ cqContext *
 caql_getattname_scan(cqContext *pCtx0, Oid relid, const char *attname)
 {
 	cqContext				*pCtx;
-
-	disable_attribute_check(relid);
+	HeapTuple tup;
 
 	/* use the provided context, or *allocate* a clean one */
 	if (pCtx0)
@@ -1120,8 +861,6 @@ caql_getattname_scan(cqContext *pCtx0, Oid relid, const char *attname)
 		pCtx = (cqContext *) palloc0(sizeof(cqContext)); 
 		pCtx->cq_free = true;  /* free this context in caql_endscan */
 	}
-
-	HeapTuple tup;
 
 	tup = SearchSysCacheAttName(relid, attname);
 
@@ -1165,7 +904,6 @@ AttrNumber caql_getattnumber(Oid relid, const char *attname)
 {
 	HeapTuple	tp;
 
-	disable_attribute_check(relid);
 	tp = SearchSysCacheAttName(relid, attname);
 	if (HeapTupleIsValid(tp))
 	{
@@ -1235,7 +973,6 @@ Oid caql_getoid_plus(cqContext *pCtx0, int *pFetchcount,
 		tuple = systable_getnext(pCtx->cq_sysScan);
 	}
 
-	disable_catalog_check(pCtx, tuple);
 	if (HeapTupleIsValid(tuple))
 	{
 		if (pFetchcount)
@@ -1339,9 +1076,6 @@ Oid caql_getoid_only(cqContext *pCtx0, bool *pbOnly, cq_list *pcql)
 		tuple = SearchSysCacheKeyArray(pCtx->cq_cacheId, 
 									   pCtx->cq_NumKeys, 
 									   pCtx->cq_cacheKeys);
-
-		disable_catalog_check(pCtx, tuple);
-
 		if (HeapTupleIsValid(tuple))
 		{
 			result = HeapTupleGetOid(tuple);
@@ -1355,8 +1089,6 @@ Oid caql_getoid_only(cqContext *pCtx0, bool *pbOnly, cq_list *pcql)
 
 	if (HeapTupleIsValid(tuple = systable_getnext(pCtx->cq_sysScan)))
 	{
-		disable_catalog_check(pCtx, tuple);
-
 		result = HeapTupleGetOid(tuple);
 
 		if (pbOnly)
@@ -1419,8 +1151,6 @@ char *caql_getcstring_plus(cqContext *pCtx0, int *pFetchcount,
 	{
 		tuple = systable_getnext(pCtx->cq_sysScan);
 	}
-
-	disable_catalog_check(pCtx, tuple);
 
 	if (HeapTupleIsValid(tuple))
 	{

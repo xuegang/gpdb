@@ -177,8 +177,8 @@ DROP TABLE oldcor;
 -- typname is out of sync
 CREATE TABLE cor (a int, b float, c text);
 UPDATE pg_type SET typname='newcor' WHERE typrelid='cor'::regclass;
-ALTER TABLE cor RENAME TO newcor;
-ALTER TABLE newcor RENAME TO cor;
+ALTER TABLE cor RENAME TO newcor2;
+ALTER TABLE newcor2 RENAME TO cor;
 DROP TABLE cor;
 
 -- relname is out of sync
@@ -265,21 +265,40 @@ DROP TABLE tmp2;
 -- is run in parallel with foreign_key.sql.
 
 CREATE TEMP TABLE PKTABLE (ptest1 int PRIMARY KEY) distributed by (ptest1);
+INSERT INTO PKTABLE VALUES(42);
 CREATE TEMP TABLE FKTABLE (ftest1 inet);
--- This next should fail, because inet=int does not exist
+-- This next should fail, because int=inet does not exist
 ALTER TABLE FKTABLE ADD FOREIGN KEY(ftest1) references pktable;
 -- This should also fail for the same reason, but here we
 -- give the column name
 ALTER TABLE FKTABLE ADD FOREIGN KEY(ftest1) references pktable(ptest1);
--- This should succeed, even though they are different types
--- because varchar=int does exist
 DROP TABLE FKTABLE;
-CREATE TEMP TABLE FKTABLE (ftest1 varchar);
+-- This should succeed, even though they are different types,
+-- because int=int8 exists and is a member of the integer opfamily
+CREATE TEMP TABLE FKTABLE (ftest1 int8);
 ALTER TABLE FKTABLE ADD FOREIGN KEY(ftest1) references pktable;
--- As should this
-ALTER TABLE FKTABLE ADD FOREIGN KEY(ftest1) references pktable(ptest1);
-DROP TABLE pktable cascade;
-DROP TABLE fktable;
+-- Check it actually works
+INSERT INTO FKTABLE VALUES(42);		-- should succeed
+INSERT INTO FKTABLE VALUES(43);		-- should fail
+DROP TABLE FKTABLE;
+-- This should fail, because we'd have to cast numeric to int which is
+-- not an implicit coercion (or use numeric=numeric, but that's not part
+-- of the integer opfamily)
+CREATE TEMP TABLE FKTABLE (ftest1 numeric);
+ALTER TABLE FKTABLE ADD FOREIGN KEY(ftest1) references pktable;
+DROP TABLE FKTABLE;
+DROP TABLE PKTABLE;
+-- On the other hand, this should work because int implicitly promotes to
+-- numeric, and we allow promotion on the FK side
+CREATE TEMP TABLE PKTABLE (ptest1 numeric PRIMARY KEY);
+INSERT INTO PKTABLE VALUES(42);
+CREATE TEMP TABLE FKTABLE (ftest1 int);
+ALTER TABLE FKTABLE ADD FOREIGN KEY(ftest1) references pktable;
+-- Check it actually works
+INSERT INTO FKTABLE VALUES(42);		-- should succeed
+INSERT INTO FKTABLE VALUES(43);		-- should fail
+DROP TABLE FKTABLE;
+DROP TABLE PKTABLE;
 
 CREATE TEMP TABLE PKTABLE (ptest1 int, ptest2 inet,
                            PRIMARY KEY(ptest1, ptest2))
@@ -528,7 +547,7 @@ drop table atacc1;
 
 -- adding a new column as primary key to a non-empty table.
 -- should fail unless the column has a non-null default value.
-create table atacc1 ( test int ) distributed by (test);
+create table atacc1 ( test int );
 insert into atacc1 (test) values (0);
 -- add a primary key column without a default (fails).
 alter table atacc1 add column test2 int primary key;
@@ -1084,6 +1103,15 @@ select * from another order by 1,2;
 
 drop table another;
 
+-- disallow recursive containment of row types
+create temp table recur1 (f1 int);
+alter table recur1 add column f2 recur1; -- fails
+alter table recur1 add column f2 recur1[]; -- fails
+create temp table recur2 (f1 int, f2 recur1);
+alter table recur1 add column f2 recur2; -- fails
+alter table recur1 add column f2 int;
+alter table recur1 alter column f2 type recur2; -- fails
+
 --
 -- alter function
 --
@@ -1141,320 +1169,3 @@ select alter2.plus1(41);
 
 -- clean up
 drop schema alter2 cascade;
-
---
--- Test ALTER TABLE ADD COLUMN WITH NULL DEFAULT on AO TABLES
---
----
---- basic support for alter add column with NULL default to AO tables
---- 
-drop table if exists ao1;
-create table ao1(col1 varchar(2), col2 int) WITH (APPENDONLY=TRUE) distributed randomly;
-
-insert into ao1 values('aa', 1);
-insert into ao1 values('bb', 2);
-
--- following should be OK.
-alter table ao1 add column col3 char(1) default 5;
-
--- the following should be supported now
-alter table ao1 add column col4 char(1) default NULL;
-
-select * from ao1;
-insert into ao1 values('cc', 3);
-select * from ao1;
-
-alter table ao1 alter column col4 drop default; 
-select * from ao1;
-insert into ao1 values('dd', 4);
-select * from ao1;
-
----
---- check catalog contents after alter table on AO tables 
----
-drop table if exists ao1;
-create table ao1(col1 varchar(2), col2 int) WITH (APPENDONLY=TRUE) distributed randomly;
-
--- relnatts is 2
-select relname, relnatts from pg_class where relname = 'ao1';
-
-alter table ao1 add column col3 char(1) default NULL;
-
--- relnatts in pg_class should be 3
-select relname, relnatts from pg_class where relname = 'ao1';
-
--- check col details in pg_attribute
-select  pg_class.relname, attname, typname from pg_attribute, pg_class, pg_type where attrelid = pg_class.oid and pg_class.relname = 'ao1' and atttypid = pg_type.oid and attname = 'col3';
-
--- no explicit entry in pg_attrdef for NULL default
-select relname, attname, adsrc from pg_class, pg_attribute, pg_attrdef where attrelid = pg_class.oid and adrelid = pg_class.oid and adnum = pg_attribute.attnum and pg_class.relname = 'ao1';
-
-
---- 
---- check with IS NOT NULL constraint
---- 
-drop table if exists ao1;
-create table ao1(col1 varchar(2), col2 int) WITH (APPENDONLY=TRUE) distributed randomly;
-
-insert into ao1 values('a', 1); 
-
--- should fail
-alter table ao1 add column col3 char(1) not null default NULL; 
-
-drop table if exists ao1;
-create table ao1(col1 varchar(2), col2 int) WITH (APPENDONLY=TRUE) distributed randomly;
-
--- should pass
-alter table ao1 add column col3 char(1) not null default NULL; 
-
--- this should fail (same behavior as heap tables)
-insert into ao1(col1, col2) values('a', 10);
----
---- alter add with no default should continue to fail
----
-drop table if exists ao1;
-create table ao1(col1 varchar(1)) with (APPENDONLY=TRUE) distributed randomly;
-
-insert into ao1 values('1');
-insert into ao1 values('1');
-insert into ao1 values('1');
-insert into ao1 values('1');
-
-alter table ao1 add column col2 char(1);
-select * from ao1;
-
---
--- MPP-19664 
--- Test ALTER TABLE ADD COLUMN WITH NULL DEFAULT on AO/CO TABLES
---
---- 
---- basic support for alter add column with NULL default to AO/CO tables
---- 
-drop table if exists aoco1;
-create table aoco1(col1 varchar(2), col2 int)
-WITH (APPENDONLY=TRUE, ORIENTATION=column) distributed randomly;
-
-insert into aoco1 values('aa', 1);
-insert into aoco1 values('bb', 2);
-
--- following should be OK.
-alter table aoco1 add column col3 char(1) default 5;
-
--- the following should be supported now
-alter table aoco1 add column col4 char(1) default NULL;
-
-select * from aoco1;
-insert into aoco1 values('cc', 3);
-select * from aoco1;
-
-alter table aoco1 alter column col4 drop default; 
-select * from aoco1;
-insert into aoco1 values('dd', 4);
-select * from aoco1;
-
----
---- check catalog contents after alter table on AO/CO tables 
----
-drop table if exists aoco1;
-create table aoco1(col1 varchar(2), col2 int)
-WITH (APPENDONLY=TRUE, ORIENTATION=column) distributed randomly;
-
--- relnatts is 2
-select relname, relnatts from pg_class where relname = 'aoco1';
-
-alter table aoco1 add column col3 char(1) default NULL;
-
--- relnatts in pg_class should be 3
-select relname, relnatts from pg_class where relname = 'aoco1';
-
--- check col details in pg_attribute
-select  pg_class.relname, attname, typname from pg_attribute, pg_class, pg_type where attrelid = pg_class.oid and pg_class.relname = 'aoco1' and atttypid = pg_type.oid and attname = 'col3';
-
--- no explicit entry in pg_attrdef for NULL default
-select relname, attname, adsrc from pg_class, pg_attribute, pg_attrdef where attrelid = pg_class.oid and adrelid = pg_class.oid and adnum = pg_attribute.attnum and pg_class.relname = 'aoco1';
-
---- 
---- check with IS NOT NULL constraint
---- 
-drop table if exists aoco1;
-create table aoco1(col1 varchar(2), col2 int)
-WITH (APPENDONLY=TRUE, ORIENTATION=column) distributed randomly;
-
-insert into aoco1 values('a', 1); 
-
--- should fail (rewrite needs to do null checking) 
-alter table aoco1 add column col3 char(1) not null default NULL; 
-alter table aoco1 add column c5 int check (c5 IS NOT NULL) default NULL;
-
--- should fail (rewrite needs to do constraint checking) 
-insert into aoco1(col1, col2) values('a', NULL);
-alter table aoco1 alter column col2 set not null; 
-
--- should pass (rewrite needs to do constraint checking) 
-alter table aoco1 alter column col2 type int; 
-
-drop table if exists aoco1;
-create table aoco1(col1 varchar(2), col2 int)
-WITH (APPENDONLY=TRUE, ORIENTATION=column) distributed randomly;
-
--- should pass
-alter table aoco1 add column col3 char(1) not null default NULL; 
-
--- this should fail (same behavior as heap tables)
-insert into aoco1 (col1, col2) values('a', 10);
-
-drop table if exists aoco1;
-create table aoco1(col1 varchar(2), col2 int not null)
-WITH (APPENDONLY=TRUE, ORIENTATION=column) distributed randomly;
-
-insert into aoco1 values('aa', 1);
-alter table aoco1 add column col3 char(1) default NULL;
-insert into aoco1 values('bb', 2);
-select * from aoco1;
-alter table aoco1 add column col4 char(1) not NULL default NULL;
-select * from aoco1;
-
----
---- alter add with no default should continue to fail
----
-drop table if exists aoco1;
-create table aoco1(col1 varchar(1))
-WITH (APPENDONLY=TRUE, ORIENTATION=column) distributed randomly;
-
-insert into aoco1 values('1');
-insert into aoco1 values('1');
-insert into aoco1 values('1');
-insert into aoco1 values('1');
-
-alter table aoco1 add column col2 char(1);
-select * from aoco1;
-
-drop table aoco1;
-
----
---- new column with a domain type
----
-drop table if exists ao1;
-create table ao1(col1 varchar(5)) with (APPENDONLY=TRUE) distributed randomly;
-
-insert into ao1 values('abcde');
-
-drop domain zipcode;
-create domain zipcode as text
-constraint c1 not null;
-
--- following should fail
-alter table ao1 add column col2 zipcode;
-
-alter table ao1 add column col2 zipcode default NULL;
-
-select * from ao1;
-
--- cleanup
-drop table ao1;
-drop domain zipcode;
-drop schema if exists mpp17582 cascade;
-create schema mpp17582;
-set search_path=mpp17582;
-
-DROP TABLE testbug_char5;
-CREATE TABLE testbug_char5
-(
-timest character varying(6),
-user_id numeric(16,0) NOT NULL,
-to_be_drop char(5), -- Iterate through different data types
-tag1 char(5), -- Iterate through different data types
-tag2 char(5)
-)
-DISTRIBUTED BY (user_id)
-PARTITION BY LIST(timest)
-(
-PARTITION part201203 VALUES('201203') WITH (APPENDONLY=true, COMPRESSLEVEL=5, ORIENTATION=column),
-PARTITION part201204 VALUES('201204') WITH (APPENDONLY=true, COMPRESSLEVEL=5, ORIENTATION=row),
-PARTITION part201205 VALUES('201205')
-);
-
-create index testbug_char5_tag1 on testbug_char5 using btree(tag1);
-
-insert into testbug_char5 (timest,user_id,to_be_drop) select '201203',1111,'10000';
-insert into testbug_char5 (timest,user_id,to_be_drop) select '201204',1111,'10000';
-insert into testbug_char5 (timest,user_id,to_be_drop) select '201205',1111,'10000';
-
-select * from testbug_char5 order by 1,2;
-
-ALTER TABLE testbug_char5 drop column to_be_drop;
-
-select * from testbug_char5 order by 1,2;
-
-insert into testbug_char5 (timest,user_id,tag2) select '201203',2222,'2';
-insert into testbug_char5 (timest,user_id,tag2) select '201204',2222,'2';
-insert into testbug_char5 (timest,user_id,tag2) select '201205',2222,'2';
-
-select * from testbug_char5 order by 1,2;
-
-alter table testbug_char5 add PARTITION part201206 VALUES('201206') WITH (APPENDONLY=true, COMPRESSLEVEL=5, ORIENTATION=column);
-alter table testbug_char5 add PARTITION part201207 VALUES('201207') WITH (APPENDONLY=true, COMPRESSLEVEL=5, ORIENTATION=row);
-alter table testbug_char5 add PARTITION part201208 VALUES('201208');
-
-insert into testbug_char5 select '201206',3333,'1','2';
-insert into testbug_char5 select '201207',3333,'1','2';
-insert into testbug_char5 select '201208',3333,'1','2';
-
-
-select * from testbug_char5 order by 1,2;
-
---
--- Check index scan
---
-
-set enable_seqscan=off;
-set enable_indexscan=on;
-
-select * from testbug_char5 where tag1='1';
-
---
--- Check NL Index scan plan
---
-
-create table dim(tag1 char(5));
-insert into dim values('1');
-
-set enable_hashjoin=off;
-set enable_seqscan=off;
-set enable_nestloop=on;
-set enable_indexscan=on;
-
-select * from testbug_char5, dim where testbug_char5.tag1=dim.tag1;
-
---
--- Load from another table
---
-
-DROP TABLE load;
-CREATE TABLE load
-(
-timest character varying(6),
-user_id numeric(16,0) NOT NULL,
-tag1 char(5),
-tag2 char(5)
-)
-DISTRIBUTED randomly;
-
-insert into load select '20120' || i , 1111 * (i + 2), '1','2' from generate_series(3,8) i;
-select * from load;
-
-insert into testbug_char5 select * from load;
-
-select * from testbug_char5;
-
---
--- Update values
---
-
-update testbug_char5 set tag1='6' where tag1='1' and timest='201208';
-update testbug_char5 set tag2='7' where tag2='1' and timest='201208';
-
-select * from testbug_char5;
-
-set search_path=public;
-drop schema if exists mpp17582 cascade;

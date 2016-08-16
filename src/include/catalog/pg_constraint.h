@@ -8,7 +8,7 @@
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/pg_constraint.h,v 1.23 2006/06/28 22:11:01 neilc Exp $
+ * $PostgreSQL: pgsql/src/include/catalog/pg_constraint.h,v 1.27 2008/01/17 18:56:54 tgl Exp $
  *
  * NOTES
  *	  the genbki.sh script reads this file and generates .bki
@@ -22,41 +22,6 @@
 #include "catalog/genbki.h"
 #include "nodes/pg_list.h"
 #include "access/attnum.h"
-
-/* TIDYCAT_BEGINFAKEDEF
-
-   CREATE TABLE pg_constraint
-   with (relid=2606, toast_oid=2832, toast_index=2833)
-   (
-   conname        name, 
-   connamespace   oid, 
-   contype        "char", 
-   condeferrable  boolean, 
-   condeferred    boolean, 
-   conrelid       oid, 
-   contypid       oid, 
-   confrelid      oid, 
-   confupdtype    "char", 
-   confdeltype    "char", 
-   confmatchtype  "char", 
-   conkey         smallint[], 
-   confkey        smallint[], 
-   conbin         text, 
-   consrc         text
-   );
-
-   create unique index on pg_constraint(oid) with (indexid=2667, CamelCase=ConstraintOid);
-   create index on pg_constraint(conname, connamespace) with (indexid=2664, CamelCase=ConstraintNameNsp);
-   create index on pg_constraint(conrelid) with (indexid=2665, CamelCase=ConstraintRelid);
-   create index on pg_constraint(contypid) with (indexid=2666, CamelCase=ConstraintTypid);
-
-   alter table pg_constraint add fk connamespace on pg_namespace(oid);
-   alter table pg_constraint add fk conrelid on pg_class(oid);
-   alter table pg_constraint add fk contypid on pg_type(oid);
-   alter table pg_constraint add fk confrelid on pg_class(oid);
-
-   TIDYCAT_ENDFAKEDEF
-*/
 
 /* ----------------
  *		pg_constraint definition.  cpp turns this into
@@ -122,6 +87,24 @@ CATALOG(pg_constraint,2606)
 	int2		confkey[1];
 
 	/*
+	 * If a foreign key, the OIDs of the PK = FK equality operators for each
+	 * column of the constraint
+	 */
+	Oid			conpfeqop[1];
+
+	/*
+	 * If a foreign key, the OIDs of the PK = PK equality operators for each
+	 * column of the constraint (i.e., equality for the referenced columns)
+	 */
+	Oid			conppeqop[1];
+
+	/*
+	 * If a foreign key, the OIDs of the FK = FK equality operators for each
+	 * column of the constraint (i.e., equality for the referencing columns)
+	 */
+	Oid			conffeqop[1];
+
+	/*
 	 * If a check constraint, nodeToString representation of expression
 	 */
 	text		conbin;
@@ -131,6 +114,12 @@ CATALOG(pg_constraint,2606)
 	 */
 	text		consrc;
 } FormData_pg_constraint;
+
+/* GPDB added foreign key definitions for gpcheckcat. */
+FOREIGN_KEY(connamespace REFERENCES pg_namespace(oid));
+FOREIGN_KEY(conrelid REFERENCES pg_class(oid));
+FOREIGN_KEY(contypid REFERENCES pg_type(oid));
+FOREIGN_KEY(confrelid REFERENCES pg_class(oid));
 
 /* ----------------
  *		Form_pg_constraint corresponds to a pointer to a tuple with
@@ -143,7 +132,7 @@ typedef FormData_pg_constraint *Form_pg_constraint;
  *		compiler constants for pg_constraint
  * ----------------
  */
-#define Natts_pg_constraint					15
+#define Natts_pg_constraint					18
 #define Anum_pg_constraint_conname			1
 #define Anum_pg_constraint_connamespace		2
 #define Anum_pg_constraint_contype			3
@@ -157,8 +146,11 @@ typedef FormData_pg_constraint *Form_pg_constraint;
 #define Anum_pg_constraint_confmatchtype	11
 #define Anum_pg_constraint_conkey			12
 #define Anum_pg_constraint_confkey			13
-#define Anum_pg_constraint_conbin			14
-#define Anum_pg_constraint_consrc			15
+#define Anum_pg_constraint_conpfeqop		14
+#define Anum_pg_constraint_conppeqop		15
+#define Anum_pg_constraint_conffeqop		16
+#define Anum_pg_constraint_conbin			17
+#define Anum_pg_constraint_consrc			18
 
 
 /* Valid values for contype */
@@ -198,6 +190,9 @@ extern Oid CreateConstraintEntry(const char *constraintName,
 								 Oid domainId,
 								 Oid foreignRelId,
 								 const int16 *foreignKey,
+								 const Oid *pfEqOp,
+								 const Oid *ppEqOp,
+								 const Oid *ffEqOp,
 								 int foreignNKeys,
 								 char foreignUpdateType,
 								 char foreignDeleteType,
@@ -208,14 +203,13 @@ extern Oid CreateConstraintEntry(const char *constraintName,
 								 const char *conSrc);
 
 extern void RemoveConstraintById(Oid conId);
+extern void RenameConstraintById(Oid conId, const char *newname);
 
 extern bool ConstraintNameIsUsed(ConstraintCategory conCat, Oid objId,
 					 Oid objNamespace, const char *conname);
 extern char *ChooseConstraintName(const char *name1, const char *name2,
 					 const char *label, Oid namespace,
 					 List *others);
-
-extern char *GetConstraintNameForTrigger(Oid triggerId);
 
 extern char * GetConstraintNameByOid(Oid constraintId);
 

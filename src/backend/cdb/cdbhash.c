@@ -1,7 +1,8 @@
 /*--------------------------------------------------------------------------
  *
  * cdbhash.c
- *	  Provides hashing routines to support consistant data distribution/location within Greenplum Database.
+ *	  Provides hashing routines to support consistant data distribution/location
+ *    within Greenplum Database.
  *
  * Copyright (c) 2005-2008, Greenplum inc
  *
@@ -13,6 +14,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <assert.h>
+#include "access/tuptoaster.h"
 #include "utils/builtins.h"
 #include "catalog/pg_type.h"
 #include "parser/parse_type.h"
@@ -26,21 +28,19 @@
 #include "utils/nabstime.h"
 #include "utils/varbit.h"
 #include "utils/acl.h"
+#include "utils/uuid.h"
 #include "fmgr.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/complex_type.h"
 #include "cdb/cdbhash.h"
 #include "cdb/cdbutil.h"
 
-/*
- * 32 bit FNV-1 and FNV-1a non-zero initial basis
- * NOTE: The FNV-1a initial basis is the same value as FNV-1 by definition.
- */
+/* 32 bit FNV-1  non-zero initial basis */
 #define FNV1_32_INIT ((uint32)0x811c9dc5)
-#define FNV1_32A_INIT FNV1_32_INIT
 
-/* Constant prime value used for an FNV1/FNV1A hash */
+/* Constant prime value used for an FNV1 hash */
 #define FNV_32_PRIME ((uint32)0x01000193)
 
 /* Constant used for hashing a NULL value */
@@ -59,11 +59,10 @@
 #define FASTMOD(x,y)		((x) & ((y)-1))
 
 /* local function declarations */
-uint32		fnv1_32_buf(void *buf, size_t len, uint32 hashval);
-uint32		fnv1a_32_buf(void *buf, size_t len, uint32 hashval);
-int			inet_getkey(inet *addr, unsigned char *inet_key, int key_size);
-int			ignoreblanks(char *data, int len);
-int			ispowof2(int numsegs);
+static uint32 fnv1_32_buf(void *buf, size_t len, uint32 hashval);
+static int	inet_getkey(inet *addr, unsigned char *inet_key, int key_size);
+static int	ignoreblanks(char *data, int len);
+static int	ispowof2(int numsegs);
 
 
 /*================================================================
@@ -81,18 +80,16 @@ int			ispowof2(int numsegs);
  * CdbHash, these are:
  *
  * 1 - number of segments in Greenplum Database.
- * 2 - hashingalgorithm used.
- * 3 - reduction method.
+ * 2 - reduction method.
  *
  * The hash value itself will be initialized for every tuple in cdbhashinit()
  */
 CdbHash *
-makeCdbHash(int numsegs, CdbHashAlg algorithm)
+makeCdbHash(int numsegs)
 {
 	CdbHash    *h;
 
 	assert(numsegs > 0);		/* verify number of segments is legal. */
-	assert(algorithm == HASH_FNV_1); /* make sure everybody uses same algorithm */
 
 	/* Create a pointer to a CdbHash that includes the hash properties */
 	h = palloc(sizeof(CdbHash));
@@ -102,12 +99,6 @@ makeCdbHash(int numsegs, CdbHashAlg algorithm)
 	 */
 	h->hash = 0;
 	h->numsegs = numsegs;
-	h->hashalg = algorithm;
-
-	if (h->hashalg == HASH_FNV_1)
-		h->hashfn = &fnv1_32_buf;
-	else if (h->hashalg == HASH_FNV_1A)
-		h->hashfn = &fnv1a_32_buf;
 
 	/*
 	 * set the reduction algorithm: If num_segs is power of 2 use bit mask,
@@ -134,9 +125,7 @@ makeCdbHash(int numsegs, CdbHashAlg algorithm)
 	h->rrindex = cdb_randint(0, UPPER_VAL);
 		
 	ereport(DEBUG4,
-	  (errmsg("CDBHASH started using algorithm %d into %d segment databases",
-			  h->hashalg,
-			  h->numsegs)));
+		(errmsg("CDBHASH hashing into %d segment databases", h->numsegs)));
 
 	return h;
 }
@@ -152,17 +141,15 @@ cdbhashinit(CdbHash *h)
 	h->hash = FNV1_32_INIT;
 }
 
-/**
+/*
  * Implements datumHashFunction
  */
 static void
 addToCdbHash(void *cdbHash, void *buf, size_t len)
 {
 	CdbHash *h = (CdbHash*)cdbHash;
-	h->hash = (h->hashfn) (buf, len, h->hash);
+	h->hash = fnv1_32_buf(buf, len, h->hash);
 }
-
-extern void varattrib_untoast_ptr_len(Datum d, char **datastart, int *len, void **tofree);
 
 /*
  * Add an attribute to the CdbHash calculation.
@@ -189,7 +176,6 @@ cdbhash(CdbHash *h, Datum datum, Oid type)
 void
 hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData)
 {
-
 	void	   *buf = NULL;		/* pointer to the data */
 	size_t		len = 0;		/* length for the data buffer */
 	
@@ -221,13 +207,15 @@ hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData)
 	
 	VarBit		*vbitptr;
 	
-	int2vector *i2vec_buf;
 	oidvector  *oidvec_buf;
+	Complex		*complex_ptr;
+	Complex		complex_buf;
+	double		complex_real;
+	double		complex_imag;
 	
 	Cash		cash_buf;
-	AclItem	   *aclitem_ptr;
-	uint32		aclitem_buf;
-	
+	pg_uuid_t  *uuid_buf;
+
 	/*
 	 * special case buffers
 	 */
@@ -235,6 +223,9 @@ hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData)
 	uint32		invalidbuf;
 
 	void *tofree = NULL;
+
+	if (typeIsEnumType(type))
+		type = ANYENUMOID;
 
 	/*
 	 * Select the hash to be performed according to the field type we are adding to the
@@ -369,6 +360,7 @@ hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData)
 		case REGOPERATOROID:		/* operator with argument types */
 		case REGCLASSOID:			/* relation name */
 		case REGTYPEOID:			/* data type name */
+		case ANYENUMOID:			/* enum type name */
 			intbuf = (int64) DatumGetUInt32(datum);	/* cast to 8 byte before hashing */
 			buf = &intbuf;
 			len = sizeof(intbuf);
@@ -479,7 +471,7 @@ hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData)
 			 * nabstime.c. We use the actual value instead
 			 * of defining it again here.
 			 */
-			if(tinterval->status == 0 ||
+			if (tinterval->status == 0 ||
 			   tinterval->data[0] == INVALID_ABSTIME ||
 			   tinterval->data[1] == INVALID_ABSTIME)
 			{
@@ -543,17 +535,6 @@ hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData)
 			break;
 			
 		/*
-		 * We prepare the hash key for aclitems just like postgresql does.
-		 * (see code and comment in acl.c: hash_aclitem() ).
-		 */
-		case ACLITEMOID:
-			aclitem_ptr = DatumGetAclItemP(datum);
-			aclitem_buf = (uint32) (aclitem_ptr->ai_privs + aclitem_ptr->ai_grantee + aclitem_ptr->ai_grantor);
-			buf = &aclitem_buf;
-			len = sizeof(aclitem_buf);
-			break;
-			
-		/*
 		 * ANYARRAY is a pseudo-type. We use it to include
 		 * any of the array types (OIDs 1007-1033 in pg_type.h).
 		 * caller needs to be sure the type is ANYARRAYOID
@@ -566,24 +547,48 @@ hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData)
 			buf = VARDATA(arrbuf);
 			break;
 			
-		case INT2VECTOROID:
-			i2vec_buf = (int2vector *) DatumGetPointer(datum);
-			len = i2vec_buf->dim1 * sizeof(int2);
-			buf = (void *)i2vec_buf->values;
-			break;
-			
 		case OIDVECTOROID:	
 			oidvec_buf = (oidvector *) DatumGetPointer(datum);
 			len = oidvec_buf->dim1 * sizeof(Oid);
 			buf = oidvec_buf->values;
 			break;
 			
-		case CASHOID: /* cash is stored in int32 internally */
+		case CASHOID: /* cash is stored in int64 internally */
 			cash_buf = (* (Cash *)DatumGetPointer(datum));
 			len = sizeof(Cash);
 			buf = &cash_buf;
 			break;
+
+		/* pg_uuid_t is defined as a char array of size UUID_LEN in uuid.c */
+		case UUIDOID:
+			uuid_buf = DatumGetUUIDP(datum);
+			len = UUID_LEN;
+			buf = (char *)uuid_buf;
+			break;
 				
+		case COMPLEXOID:		
+			complex_ptr  = DatumGetComplexP(datum);
+			complex_real = re(complex_ptr);
+			complex_imag = im(complex_ptr);
+			/*
+			* On IEEE-float machines, minus zero and zero have different bit
+			* patterns but should compare as equal.  We must ensure that they
+			* have the same hash value, which is most easily done this way:
+			*/
+			if (complex_real == (float8) 0)
+			{
+				complex_real = 0.0;
+			}
+			if (complex_imag == (float8) 0)
+			{
+				complex_imag = 0.0;
+			}
+				
+			INIT_COMPLEX(&complex_buf, complex_real, complex_imag);
+			len = sizeof(Complex);
+			buf = (unsigned char *) &complex_buf;
+			break;
+
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_CDB_FEATURE_NOT_YET),
@@ -593,7 +598,7 @@ hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData)
 
 	/* do the hash using the selected algorithm */
 	hashFn(clientData, buf, len);
-	if(tofree)
+	if (tofree)
 		pfree(tofree);
 }
 
@@ -606,7 +611,7 @@ cdbhashnull(CdbHash *h)
 	hashNullDatum(addToCdbHash, (void*)h);
 }
 
-/**
+/*
  * Update the hash value for a null Datum
  *
  * @param hashFn called to update the hash value.
@@ -634,12 +639,11 @@ cdbhashnokey(CdbHash *h)
 	void	   *buf = &rrbuf;
 	size_t		len = sizeof(rrbuf);
 	
-	/* do the hash using the selected algorithm */
-	h->hash = (h->hashfn) (buf, len, h->hash);
+	/* compute the hash */
+	h->hash = fnv1_32_buf(buf, len, h->hash);
 	
 	h->rrindex++; /* increment for next time around */
 }
-
 
 
 /*
@@ -693,18 +697,43 @@ typeIsArrayType(Oid typeoid)
 	return res;
 }
 
+bool
+typeIsEnumType(Oid typeoid)
+{
+	Type tup = typeidType(typeoid);
+	Form_pg_type typeform;
+	bool res = false;
 
-bool isGreenplumDbHashable(Oid typid)
+	typeform = (Form_pg_type) GETSTRUCT(tup);
+
+	if (typeform->typtype == 'e' && typeform->typinput == F_ENUM_IN)
+		res = true;
+
+	ReleaseType(tup);
+	return res;
+}
+
+bool
+isGreenplumDbHashable(Oid typid)
 {
 	/* we can hash all arrays */
 	if (typeIsArrayType(typid))
 		return true;
-	/*
-	 * if this type is a domain type, get its base type.
-	 */
+
+	/* if this type is a domain type, get its base type */
 	if (get_typtype(typid) == 'd')
 		typid = getBaseType(typid);
 	
+	/* we can hash all enums */
+	if (typeIsEnumType(typid))
+		return true;
+
+	/*
+	 * NB: Every GPDB-hashable datatype must also be mergejoinable, i.e.
+	 * must have a B-tree operator family. There is a sanity check for
+	 * that in the opr_sanity_gp regression test. If you modify the list
+	 * below, please also update the list in opr_sanity_gp!
+	 */
 	switch(typid)
 	{
 		case INT2OID:		
@@ -742,11 +771,11 @@ bool isGreenplumDbHashable(Oid typid)
 		case BITOID:
 		case VARBITOID:
 		case BOOLOID:			
-		case ACLITEMOID:
 		case ANYARRAYOID:	
-		case INT2VECTOROID:
 		case OIDVECTOROID:	
 		case CASHOID: 
+		case UUIDOID:
+		case COMPLEXOID:
 			return true;
 		default:
 			return false;
@@ -764,7 +793,7 @@ bool isGreenplumDbHashable(Oid typid)
  * returns:
  *	32 bit hash as a static hash type
  */
-uint32
+static uint32
 fnv1_32_buf(void *buf, size_t len, uint32 hval)
 {
 	unsigned char *bp = (unsigned char *) buf;	/* start of buffer */
@@ -775,7 +804,6 @@ fnv1_32_buf(void *buf, size_t len, uint32 hval)
 	 */
 	while (bp < be)
 	{
-
 		/* multiply by the 32 bit FNV magic prime mod 2^32 */
 #if defined(NO_FNV_GCC_OPTIMIZATION)
 		hval *= FNV_32_PRIME;
@@ -785,44 +813,6 @@ fnv1_32_buf(void *buf, size_t len, uint32 hval)
 
 		/* xor the bottom with the current octet */
 		hval ^= (uint32) *bp++;
-	}
-
-	/* return our new hash value */
-	return hval;
-}
-
-/*
- * fnv1a_32_buf - perform a 32 bit FNV 1A hash on a buffer
- *
- * input:
- *	buf - start of buffer to hash
- *	len - length of buffer in octets (bytes)
- *	hval	- previous hash value or FNV1_32_INIT if first call.
- *
- * returns:
- *	32 bit hash as a static hash type
- */
-uint32
-fnv1a_32_buf(void *buf, size_t len, uint32 hval)
-{
-	unsigned char *bp = (unsigned char *) buf;	/* start of buffer */
-	unsigned char *be = bp + len;		/* beyond end of buffer */
-
-	/*
-	 * FNV-1 hash each octet in the buffer
-	 */
-	while (bp < be)
-	{
-
-		/* xor the bottom with the current octet */
-		hval ^= (uint32) *bp++;
-
-		/* multiply by the 32 bit FNV magic prime mod 2^32 */
-#if defined(NO_FNV_GCC_OPTIMIZATION)
-		hval *= FNV_32_PRIME;
-#else
-		hval += (hval << 1) + (hval << 4) + (hval << 7) + (hval << 8) + (hval << 24);
-#endif
 	}
 
 	/* return our new hash value */
@@ -835,7 +825,8 @@ fnv1a_32_buf(void *buf, size_t len, uint32 hval)
  * Since network_cmp considers only ip_family, ip_bits, and ip_addr,
  * only these fields may be used in the hash; in particular don't use type.
  */
-int inet_getkey(inet *addr, unsigned char *inet_key, int key_size)
+static int
+inet_getkey(inet *addr, unsigned char *inet_key, int key_size)
 {
 	int			addrsize;
 	
@@ -869,31 +860,31 @@ int inet_getkey(inet *addr, unsigned char *inet_key, int key_size)
 /*
  * Given the original length of the data array this function is
  * recalculating the length after ignoring any trailing blanks. The
- * actual data is remained unmodified.
+ * actual data remains unmodified.
  */
-int
+static int
 ignoreblanks(char *data, int len)
 {
-
 	/* look for trailing blanks and skip them in the hash calculation */
 	while (data[len - 1] == ' ')
 	{
 		len--;
-		if (len == 1)			/* if only 1 char is left, leave it alone!
-								 * (the string is either empty or has 1 char) */
+		/*
+		 * If only 1 char is left, leave it alone! The string is either empty
+		 * or has 1 char
+		 */
+		if (len == 1)
 			break;
 	}
 
 	return len;
-
 }
 
 /*
- * returns 1 is the input int is a power of 2 and 0 otherwize.
+ * returns 1 is the input int is a power of 2 and 0 otherwise.
  */
-int
+static int
 ispowof2(int numsegs)
 {
-
 	return !(numsegs & (numsegs - 1));
 }

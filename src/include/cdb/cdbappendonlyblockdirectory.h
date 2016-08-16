@@ -76,7 +76,7 @@ typedef struct MinipagePerColumnGroup
  * I don't know the ideal value here. But let us put approximate
  * 8 minipages per heap page.
  */
-#define NUM_MINIPAGE_ENTRIES (((MaxTupleSize)/8 - sizeof(HeapTupleHeaderData) - 64 * 3)\
+#define NUM_MINIPAGE_ENTRIES (((MaxHeapTupleSize)/8 - sizeof(HeapTupleHeaderData) - 64 * 3)\
 							  / sizeof(MinipageEntry))
 
 /*
@@ -90,7 +90,8 @@ typedef struct AppendOnlyBlockDirectory
 	Relation blkdirIdx;
 	int numColumnGroups;
 	bool isAOCol;
-	
+	bool *proj; /* projected columns, used only if isAOCol = TRUE */
+
 	MemoryContext memoryContext;
 	
 	int				totalSegfiles;
@@ -166,7 +167,6 @@ extern bool AppendOnlyBlockDirectory_GetEntry(
 	AppendOnlyBlockDirectoryEntry	*directoryEntry);
 extern void AppendOnlyBlockDirectory_Init_forInsert(
 	AppendOnlyBlockDirectory *blockDirectory,
-	AppendOnlyEntry *aoEntry,
 	Snapshot appendOnlyMetaDataSnapshot,
 	FileSegInfo *segmentFileInfo,
 	int64 lastSequence,
@@ -176,16 +176,15 @@ extern void AppendOnlyBlockDirectory_Init_forInsert(
 	bool isAOCol);
 extern void AppendOnlyBlockDirectory_Init_forSearch(
 	AppendOnlyBlockDirectory *blockDirectory,
-	AppendOnlyEntry *aoEntry,
 	Snapshot appendOnlyMetaDataSnapshot,
 	FileSegInfo **segmentFileInfo,
 	int totalSegfiles,
 	Relation aoRel,
 	int numColumnGroups,
-	bool isAOCol);
+	bool isAOCol,
+	bool *proj);
 extern void AppendOnlyBlockDirectory_Init_addCol(
 	AppendOnlyBlockDirectory *blockDirectory,
-	AppendOnlyEntry *aoEntry,
 	Snapshot appendOnlyMetaDataSnapshot,
 	FileSegInfo *segmentFileInfo,
 	Relation aoRel,
@@ -218,7 +217,7 @@ extern void AppendOnlyBlockDirectory_End_forSearch(
 extern void AppendOnlyBlockDirectory_End_addCol(
 	AppendOnlyBlockDirectory *blockDirectory);
 extern void AppendOnlyBlockDirectory_DeleteSegmentFile(
-		AppendOnlyEntry *aoEntry,
+	Relation aoRel,
 		Snapshot snapshot,
 		int segno,
 		int columnGroupNo);

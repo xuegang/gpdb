@@ -13,7 +13,7 @@
 #include "utils/sharedcache.h"
 #include "cdb/cdbvars.h"
 #include "utils/memutils.h"
-#include "utils/atomic.h"
+#include "utils/gp_atomic.h"
 #include "cdb/cdbutil.h"
 
 /* Suffix used to generate shared memory hashtable name from cache name */
@@ -130,7 +130,6 @@ Cache_InitCacheEntry(Cache *cache, CacheEntry *entry)
 	entry->state = CACHE_ENTRY_FREE;
 	entry->pinCount = 0;
 	entry->size = 0L;
-	entry->utility = 0;
 
 #ifdef USE_ASSERT_CHECKING
 			Cache_MemsetPayload(cache, entry);
@@ -177,7 +176,6 @@ Cache_InitSharedMem(CacheCtl *cacheCtl, Cache *cache)
 		cache->cacheHdr->keyOffset = cacheCtl->keyOffset;
 		cache->cacheHdr->entrySize = cacheCtl->entrySize;
 		SpinLockInit(&cache->cacheHdr->spinlock);
-		Cache_InitReplacementPolicy(cache);
 
 		Cache_ResetStats(&cache->cacheHdr->cacheStats);
 		cache->cacheHdr->cacheStats.noFreeEntries = cacheCtl->maxSize;
@@ -328,7 +326,6 @@ Cache_Create(CacheCtl *cacheCtl)
 	Assert(NULL != cacheCtl->keyCopy);
 	Assert(NULL != cacheCtl->hash);
 	Assert(NULL != cacheCtl->match);
-	Assert(NULL != cacheCtl->equivalentEntries);
 	Assert(NULL != cacheCtl->cleanupEntry);
 
 	MemoryContext oldcxt;
@@ -344,7 +341,6 @@ Cache_Create(CacheCtl *cacheCtl)
 	cache->keyCopy = cacheCtl->keyCopy;
 	cache->hash = cacheCtl->hash;
 	cache->match = cacheCtl->match;
-	cache->equivalentEntries = cacheCtl->equivalentEntries;
 	cache->cleanupEntry = cacheCtl->cleanupEntry;
 	cache->populateEntry = cacheCtl->populateEntry;
 	/* Create new linked lists in top memory context for cleanup */
@@ -394,11 +390,11 @@ Cache_AcquireEntry(Cache *cache, void *populate_param)
 
 	CACHE_ASSERT_WIPED(newEntry);
 
-
+	uint32 expected = CACHE_ENTRY_FREE;
 #ifdef USE_ASSERT_CHECKING
 	int32 casResult =
 #endif
-	compare_and_swap_32(&newEntry->state, CACHE_ENTRY_FREE, CACHE_ENTRY_RESERVED);
+	pg_atomic_compare_exchange_u32((pg_atomic_uint32 *)&newEntry->state, &expected, CACHE_ENTRY_RESERVED);
 	Assert(1 == casResult);
 
 	/*
@@ -411,10 +407,11 @@ Cache_AcquireEntry(Cache *cache, void *populate_param)
 		cache->populateEntry(CACHE_ENTRY_PAYLOAD(newEntry), populate_param);
 	}
 
+	expected = CACHE_ENTRY_RESERVED;
 #ifdef USE_ASSERT_CHECKING
 	casResult =
 #endif
-	compare_and_swap_32(&newEntry->state, CACHE_ENTRY_RESERVED, CACHE_ENTRY_ACQUIRED);
+	pg_atomic_compare_exchange_u32((pg_atomic_uint32 *)&newEntry->state, &expected, CACHE_ENTRY_ACQUIRED);
 	Assert(1 == casResult);
 
 	Cache_RegisterCleanup(cache, newEntry, false /* isCachedEntry */ );
@@ -496,7 +493,7 @@ Cache_ReleaseAcquired(Cache *cache, CacheEntry *entry, bool unregisterCleanup)
 
 	Cache_AddToFreelist(cache, entry);
 
-	Cache_UpdatePerfCounter(&cache->cacheHdr->cacheStats.noAcquiredEntries, -1 /* delta */ );
+	Cache_DecPerfCounter(&cache->cacheHdr->cacheStats.noAcquiredEntries, 1 /* delta */ );
 }
 
 /*
@@ -523,8 +520,8 @@ Cache_GetFreeElement(Cache *cache)
 
 	cacheHdr->freeList = cacheHdr->freeList->nextEntry;
 
-	Cache_UpdatePerfCounter(&cacheHdr->cacheStats.noFreeEntries, -1 /* delta */ );
-	Cache_UpdatePerfCounter(&cacheHdr->cacheStats.noAcquiredEntries, 1 /* delta */);
+	Cache_DecPerfCounter(&cacheHdr->cacheStats.noFreeEntries, 1 /* delta */ );
+	Cache_AddPerfCounter(&cacheHdr->cacheStats.noAcquiredEntries, 1 /* delta */);
 
 	SpinLockRelease(&cacheHdr->spinlock);
 
@@ -551,7 +548,7 @@ Cache_AddToFreelist(Cache *cache, CacheEntry *entry)
 
 	entry->nextEntry = cacheHdr->freeList;
 	cacheHdr->freeList = entry;
-	Cache_UpdatePerfCounter(&cacheHdr->cacheStats.noFreeEntries, 1 /* delta */);
+	Cache_AddPerfCounter(&cacheHdr->cacheStats.noFreeEntries, 1 /* delta */);
 
 	SpinLockRelease(&cacheHdr->spinlock);
 }
@@ -584,10 +581,10 @@ Cache_Insert(Cache *cache, CacheEntry *entry)
 
 	Cache_Stats *cacheStats = &cache->cacheHdr->cacheStats;
 	Cache_TimedOperationStart();
-	Cache_UpdatePerfCounter(&cacheStats->noInserts, 1 /* delta */);
-	Cache_UpdatePerfCounter(&cacheStats->noCachedEntries, 1 /* delta */);
-	Cache_UpdatePerfCounter(&cacheStats->noAcquiredEntries, -1 /* delta */);
-	Cache_UpdatePerfCounter64(&cacheStats->totalEntrySize, entry->size);
+	Cache_AddPerfCounter(&cacheStats->noInserts, 1 /* delta */);
+	Cache_AddPerfCounter(&cacheStats->noCachedEntries, 1 /* delta */);
+	Cache_DecPerfCounter(&cacheStats->noAcquiredEntries, 1 /* delta */);
+	Cache_AddPerfCounter64(&cacheStats->totalEntrySize, entry->size);
 
 	Cache_ComputeEntryHashcode(cache, entry);
 
@@ -618,11 +615,11 @@ Cache_Insert(Cache *cache, CacheEntry *entry)
 
 	Cache_EntryAddRef(cache, entry);
 
+	uint32 expected = CACHE_ENTRY_ACQUIRED;
 #ifdef USE_ASSERT_CHECKING
 	int32 casResult =
 #endif
-
-	compare_and_swap_32(&entry->state, CACHE_ENTRY_ACQUIRED, CACHE_ENTRY_CACHED);
+	pg_atomic_compare_exchange_u32((pg_atomic_uint32 *)&entry->state, &expected, CACHE_ENTRY_CACHED);
 	Assert(1 == casResult);
 	Assert(NULL != anchor->firstEntry && NULL != anchor->lastEntry);
 
@@ -639,94 +636,6 @@ Cache_Insert(Cache *cache, CacheEntry *entry)
 }
 
 /*
- * Look up an exact match for a cache entry
- *
- * Returns the matching cache entry if found, NULL otherwise
- */
-CacheEntry *
-Cache_Lookup(Cache *cache, CacheEntry *entry)
-{
-	Assert(NULL != cache);
-	Assert(NULL != entry);
-
-	Cache_TimedOperationStart();
-	Cache_UpdatePerfCounter(&cache->cacheHdr->cacheStats.noLookups, 1 /* delta */);
-
-	/* Advance the clock for the replacement policy */
-	Cache_AdvanceClock(cache);
-
-	Cache_ComputeEntryHashcode(cache, entry);
-
-	volatile CacheAnchor *anchor = SyncHTLookup(cache->syncHashtable, &entry->hashvalue);
-	if (NULL == anchor)
-	{
-		/* No matching anchor found, there can't be a matching element in the cache */
-		Cache_TimedOperationRecord(&cache->cacheHdr->cacheStats.timeLookups,
-				&cache->cacheHdr->cacheStats.maxTimeLookup);
-		return NULL;
-	}
-
-	/* Acquire anchor lock to touch the chain */
-	SpinLockAcquire(&anchor->spinlock);
-
-	CacheEntry *crtEntry = anchor->firstEntry;
-
-	while (true)
-	{
-
-		while (NULL != crtEntry && crtEntry->state == CACHE_ENTRY_DELETED)
-		{
-			/* Skip over deleted entries */
-			crtEntry = crtEntry->nextEntry;
-		}
-
-		if (NULL == crtEntry)
-		{
-			/* No valid entries found in the chain */
-			SpinLockRelease(&anchor->spinlock);
-			Cache_TimedOperationRecord(&cache->cacheHdr->cacheStats.timeLookups,
-					&cache->cacheHdr->cacheStats.maxTimeLookup);
-			return NULL;
-		}
-
-		/* Found a valid entry. AddRef it and test to see if it matches */
-		Cache_EntryAddRef(cache, crtEntry);
-
-		SpinLockRelease(&anchor->spinlock);
-
-		/* Register it for cleanup in case we get an error while testing for equality */
-		Cache_RegisterCleanup(cache, crtEntry, true /* isCachedEntry */);
-
-		Cache_UpdatePerfCounter(&cache->cacheHdr->cacheStats.noCompares, 1 /* delta */);
-
-		if(cache->equivalentEntries(CACHE_ENTRY_PAYLOAD(entry),
-				CACHE_ENTRY_PAYLOAD(crtEntry)))
-		{
-			/* Found the match, we're done */
-			Cache_TouchEntry(cache, crtEntry);
-			Cache_UpdatePerfCounter(&cache->cacheHdr->cacheStats.noCacheHits, 1 /* delta */);
-			break;
-		}
-
-		/* Unregister it from cleanup since it wasn't the one */
-		Cache_UnregisterCleanup(cache, crtEntry);
-
-		SpinLockAcquire(&anchor->spinlock);
-
-		Cache_EntryDecRef(cache, crtEntry);
-
-		crtEntry = crtEntry->nextEntry;
-	}
-
-	/* ignoring return value, both values are valid */
-	SyncHTRelease(cache->syncHashtable, (void *) anchor);
-
-	Cache_TimedOperationRecord(&cache->cacheHdr->cacheStats.timeLookups,
-			&cache->cacheHdr->cacheStats.maxTimeLookup);
-	return crtEntry;
-}
-
-/*
  * Unlink a cache entry from the chain anchored at a CacheAnchor.
  *
  * This function is not synchronized. The caller must hold the spinlock at
@@ -739,7 +648,7 @@ Cache_UnlinkEntry(Cache *cache, CacheAnchor *anchor, CacheEntry *entry)
 	Assert(NULL != anchor);
 	Assert(NULL != anchor->firstEntry);
 
-	Cache_UpdatePerfCounter64(&cache->cacheHdr->cacheStats.totalEntrySize, -entry->size);
+	Cache_DecPerfCounter64(&cache->cacheHdr->cacheStats.totalEntrySize, entry->size);
 
 	/* Easy case: Remove first element */
 	if (anchor->firstEntry == entry)
@@ -830,7 +739,7 @@ Cache_ReleaseCached(Cache *cache, CacheEntry *entry, bool unregisterCleanup)
 		Cache_UnlinkEntry(cache, (CacheAnchor *) anchor, entry);
 		deleteEntry = true;
 
-		Cache_UpdatePerfCounter(&cache->cacheHdr->cacheStats.noDeletedEntries, -1 /* delta */);
+		Cache_DecPerfCounter(&cache->cacheHdr->cacheStats.noDeletedEntries, 1 /* delta */);
 	}
 
 	SpinLockRelease(&anchor->spinlock);
@@ -907,67 +816,15 @@ Cache_Remove(Cache *cache, CacheEntry *entry)
 {
 	Assert(NULL != entry);
 
+	uint32 expected = CACHE_ENTRY_CACHED;
 #ifdef USE_ASSERT_CHECKING
 	int32 casResult =
 #endif
-	compare_and_swap_32(&entry->state, CACHE_ENTRY_CACHED, CACHE_ENTRY_DELETED);
+	pg_atomic_compare_exchange_u32((pg_atomic_uint32 *)&entry->state, &expected, CACHE_ENTRY_DELETED);
 	Assert(casResult == 1);
 
-	Cache_UpdatePerfCounter(&cache->cacheHdr->cacheStats.noCachedEntries, -1 /* delta */);
-	Cache_UpdatePerfCounter(&cache->cacheHdr->cacheStats.noDeletedEntries, 1 /* delta */);
-}
-
-/*
- * Sweeps through the cache and marks all entries as deleted
- *
- * Returns the number of elements it found and marked deleted.
- */
-int32
-Cache_Clear(Cache *cache)
-{
-	Assert(NULL != cache);
-
-	int32 startIdx = cdb_randint(cache->cacheHdr->nEntries - 1, 0);
-	int32 entryIdx = startIdx;
-	int32 numClearedEntries = 0;
-
-	while (true)
-	{
-		entryIdx = (entryIdx + 1) % cache->cacheHdr->nEntries;
-		if (entryIdx == startIdx)
-		{
-			/* Completed one loop through the list of all entries. We're done */
-			break;
-		}
-
-		CacheEntry *crtEntry = Cache_GetEntryByIndex(cache->cacheHdr, entryIdx);
-		if (crtEntry->state != CACHE_ENTRY_CACHED)
-		{
-			/* Not interested in free/acquired/deleted entries. Go back and look at next entry */
-			continue;
-		}
-
-		/* Found cached entry */
-		Cache_EntryAddRef(cache, crtEntry);
-
-		if (crtEntry->state == CACHE_ENTRY_FREE || crtEntry->state == CACHE_ENTRY_ACQUIRED)
-		{
-			/* Someone freed up the entry before we had a chance to Add-Ref it. Skip it. */
-			Cache_EntryDecRef(cache, crtEntry);
-			continue;
-		}
-
-		Cache_RegisterCleanup(cache, crtEntry, true /* isCachedEntry */);
-
-		Cache_Remove(cache, crtEntry);
-
-		Cache_Release(cache, crtEntry);
-
-		numClearedEntries++;
-
-	}
-
-	return numClearedEntries;
+	Cache_DecPerfCounter(&cache->cacheHdr->cacheStats.noCachedEntries, 1 /* delta */);
+	Cache_AddPerfCounter(&cache->cacheHdr->cacheStats.noDeletedEntries, 1 /* delta */);
 }
 
 /*
@@ -1019,7 +876,7 @@ Cache_EntryAddRef(Cache *cache, CacheEntry *entry)
 
 	if (1 == entry->pinCount)
 	{
-		Cache_UpdatePerfCounter(&cache->cacheHdr->cacheStats.noPinnedEntries, 1 /* delta */);
+		Cache_AddPerfCounter(&cache->cacheHdr->cacheStats.noPinnedEntries, 1 /* delta */);
 	}
 
 	return entry->pinCount;
@@ -1041,7 +898,7 @@ Cache_EntryDecRef(Cache *cache, CacheEntry *entry)
 
 	if (0 == entry->pinCount)
 	{
-		Cache_UpdatePerfCounter(&cache->cacheHdr->cacheStats.noPinnedEntries, -1 /* delta */);
+		Cache_DecPerfCounter(&cache->cacheHdr->cacheStats.noPinnedEntries, 1 /* delta */);
 	}
 
 	return entry->pinCount;
@@ -1061,22 +918,41 @@ Cache_GetEntryByIndex(CacheHdr *cacheHdr, int32 idx)
 }
 
 /*
- * Updates the given performance counter by delta
+ * Atomically increments the performance counter
  *
- * delta can be positive or negative
+ * delta must be positive
  */
 void
-Cache_UpdatePerfCounter(uint32 *counter, int delta)
+Cache_AddPerfCounter(uint32 *counter, int delta)
 {
 	Assert(counter + delta >= 0);
-	gp_atomic_add_32((int32 *) counter, delta);
+	pg_atomic_add_fetch_u32((pg_atomic_uint32 *) counter,delta);
 }
 
 void
-Cache_UpdatePerfCounter64(int64 *counter, int64 delta)
+Cache_AddPerfCounter64(int64 *counter, int64 delta)
 {
 	Assert(counter + delta >= 0);
-	gp_atomic_add_64(counter, delta);
+	pg_atomic_add_fetch_u64((pg_atomic_uint64 *) counter,delta);
+}
+
+/*
+ * Atomically decrements the performance counter
+ *
+ * delta must be positive
+ */
+void
+Cache_DecPerfCounter(uint32 *counter, int delta)
+{
+	Assert(counter - delta >= 0);
+	pg_atomic_sub_fetch_u32((pg_atomic_uint32 *) counter,delta);
+}
+
+void
+Cache_DecPerfCounter64(int64 *counter, int64 delta)
+{
+	Assert(counter - delta >= 0);
+	pg_atomic_sub_fetch_u64((pg_atomic_uint64 *) counter,delta);
 }
 
 /*

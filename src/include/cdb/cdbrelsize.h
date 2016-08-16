@@ -12,11 +12,9 @@
 #ifndef CDBRELSIZE_H_
 #define CDBRELSIZE_H_
 
-#include "utils/rel.h"
+#include "utils/relcache.h"
 
-extern void clear_relsize_cache(void);
-
-extern int64 cdbRelSize(Relation rel);
+extern int64 cdbRelMaxSegSize(Relation rel);
 
 
 #endif /*CDBRELSIZE_H_*/

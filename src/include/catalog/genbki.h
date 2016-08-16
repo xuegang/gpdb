@@ -33,6 +33,12 @@
 #define DESCR(x)  extern int no_such_variable
 #define SHDESCR(x) extern int no_such_variable
 
+/* for process_col_defaults.pl */
+#define GPDB_COLUMN_DEFAULT(col, default) extern int no_such_variable
+
+/* for process_foreign_keys.pl */
+#define FOREIGN_KEY(x) extern int no_such_variable
+
 /* PHONY type definition for use in catalog structure definitions only */
 typedef int aclitem;
 

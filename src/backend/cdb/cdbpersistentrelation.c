@@ -86,11 +86,6 @@ static void PersistentRelation_VerifyInitScan(void)
 // Helpers 
 // -----------------------------------------------------------------------------
 
-inline static void XLogRecPtr_Zero(XLogRecPtr *xlogLoc)
-{
-	MemSet(xlogLoc, 0, sizeof(XLogRecPtr));
-}
-
 void PersistentRelation_FlushXLog(void)
 {
 	PersistentFileSysObj_FlushXLog();
@@ -345,13 +340,7 @@ void PersistentRelation_AddCreatePending(
 						segmentFileNum);	
 #endif
 
-	#ifdef FAULT_INJECTOR
-			FaultInjector_InjectFaultIfSet(
-										   FaultBeforePendingDeleteRelationEntry,
-										   DDLNotSpecified,
-										   "",  // databaseName
-										   ""); // tableName
-	#endif
+	SIMPLE_FAULT_INJECTOR(FaultBeforePendingDeleteRelationEntry);
 
    /* We'll add an entry to the PendingDelete LinkedList (LL) to remeber what we
     * created in this transaction (or sub-transaction). If the transaction
